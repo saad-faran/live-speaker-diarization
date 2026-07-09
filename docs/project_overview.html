@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Live Speaker Diarization — Complete Project Guide</title>
+<style>
+  :root{--ink:#12233b;--muted:#5b6b7f;--line:#c9d4e0;--accent:#1f6feb;--hd:#eaf0f7;
+        --a:#e8f0fe;--b:#e7f7ee;--c:#fdf0e3;--d:#f3e9fb}
+  *{box-sizing:border-box}
+  html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);margin:0;font-size:10.5px;line-height:1.45}
+  .page{width:210mm;min-height:296mm;padding:13mm;margin:0 auto;background:#fff;position:relative}
+  h1{font-size:20px;margin:0 0 2px}
+  h2{font-size:12.5px;margin:13px 0 5px;color:var(--accent);border-bottom:1.5px solid var(--line);padding-bottom:2px;text-transform:uppercase;letter-spacing:.4px}
+  h3{font-size:11px;margin:8px 0 2px}
+  .sub{color:var(--muted);font-size:10.5px;margin:0 0 5px}
+  .lead{background:var(--hd);border-left:3px solid var(--accent);padding:7px 10px;border-radius:4px;margin:6px 0}
+  ul{margin:4px 0 4px 16px;padding:0} li{margin:2px 0}
+  .kw{font-family:ui-monospace,Menlo,Consolas,monospace;background:#f4f6f9;border:1px solid var(--line);border-radius:3px;padding:0 4px;font-size:9.3px;white-space:nowrap}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px}
+  .card{border:1px solid var(--line);border-radius:6px;padding:7px 9px}
+  .card h3{margin:0 0 3px}
+  table{border-collapse:collapse;width:100%;font-size:9.4px;margin-top:3px}
+  th,td{border:1px solid var(--line);padding:3px 6px;text-align:left;vertical-align:top} th{background:var(--hd)}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:9.4px}
+  pre{background:#0f1b2d;color:#dbe7f5;border-radius:6px;padding:8px 10px;font-size:8.9px;overflow:hidden;margin:5px 0}
+  .foot{color:var(--muted);font-size:9px;border-top:1px solid var(--line);margin-top:11px;padding-top:5px}
+  .cap{text-align:center;color:var(--muted);font-size:9px;margin-top:1px}
+  .pb{page-break-before:always}
+  .tag{display:inline-block;background:var(--a);border:1px solid var(--line);border-radius:9px;padding:0 7px;font-size:8.6px;font-weight:700}
+  @page{size:A4;margin:0}
+</style></head>
+<body>
+
+<!-- ============ PAGE 1 ============ -->
+<div class="page">
+  <h1>Live Speaker Diarization — Complete Project Guide</h1>
+  <p class="sub">Real-time “who is speaking” on live streams · from-scratch explanation · open-source · GPU or CPU · Windows / Linux / macOS</p>
+
+  <h2>1 · What This Project Is</h2>
+  <p><b>Speaker diarization</b> answers <b>“who spoke when?”</b> — it splits audio into time
+  segments and labels each with a speaker (<span class="kw">SPEAKER_00</span>, <span class="kw">SPEAKER_01</span>, …),
+  giving the <i>same voice</i> the <i>same label</i> throughout. It does <b>not</b> name people; it distinguishes
+  and tracks <i>distinct voices</i>. This project does it <b>live</b>: on a never-ending stream, it reports the
+  current speaker within a few seconds, continuously.</p>
+
+  <div class="grid2">
+    <div class="card"><h3>Two settings of the same problem</h3>
+      <ul>
+        <li><b>Offline</b> (foundation): the whole recording is available at once → highest accuracy.</li>
+        <li><b>Online / real-time</b> (this repo): audio arrives forever; you must decide <i>now</i>, with only
+        recent context, and never fall behind.</li>
+      </ul></div>
+    <div class="card"><h3>Two classic failures we defeat</h3>
+      <ul>
+        <li><b>Fragmentation:</b> one real person split into many phantom speaker IDs.</li>
+        <li><b>Label permutation:</b> speaker labels randomly swapping between chunks.</li>
+      </ul>
+      Solved by a neural diarizer + a <b>persistent speaker registry</b> (below).
+    </div>
+  </div>
+
+  <h2>2 · The Neural Diarization Foundation (offline core)</h2>
+  <p>Both offline and online build on the same neural pipeline. Audio is decoded to
+  <b>16 kHz mono</b>, then processed in five stages:</p>
+
+  <svg viewBox="0 0 760 96" width="720">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5b6b7f"/></marker>
+      <style>.bx{rx:7;stroke:#c9d4e0;stroke-width:1.2}.t{font:600 9.5px -apple-system,Arial;fill:#12233b}.s{font:8.2px ui-monospace,Menlo;fill:#5b6b7f}.ln{stroke:#5b6b7f;stroke-width:1.3;fill:none;marker-end:url(#ar)}</style>
+    </defs>
+    <rect class="bx" x="4"   y="20" width="140" height="52" fill="#e8f0fe"/><text class="t" x="14" y="40">1–2 · VAD + Segment</text><text class="s" x="14" y="54">PyanNet · 10 s window</text><text class="s" x="14" y="65">1 s step (90% overlap)</text>
+    <rect class="bx" x="168" y="20" width="140" height="52" fill="#e7f7ee"/><text class="t" x="178" y="40">3 · Embeddings</text><text class="s" x="178" y="54">256-d voice vector</text><text class="s" x="178" y="65">per speech turn</text>
+    <rect class="bx" x="332" y="20" width="140" height="52" fill="#e7f7ee"/><text class="t" x="342" y="40">4 · Clustering</text><text class="s" x="342" y="54">VBx, cosine</text><text class="s" x="342" y="65">group → N speakers</text>
+    <rect class="bx" x="496" y="20" width="140" height="52" fill="#fdf0e3"/><text class="t" x="506" y="40">5 · Timeline</text><text class="s" x="506" y="54">SPEAKER_XX +</text><text class="s" x="506" y="65">start/end times</text>
+    <rect class="bx" x="660" y="20" width="96" height="52" fill="#eef2f7"/><text class="t" x="670" y="40">Same voice</text><text class="s" x="670" y="54">≈0.83 cos</text><text class="s" x="670" y="65">diff ≈0.10</text>
+    <path class="ln" d="M144,46 L166,46"/><path class="ln" d="M308,46 L330,46"/><path class="ln" d="M472,46 L494,46"/><path class="ln" d="M636,46 L658,46"/>
+  </svg>
+  <p class="cap">Fig. 1 — The neural pipeline. Steps 1–3 are neural nets; step 4 clusters the voice fingerprints. The wide 0.83-vs-0.10 gap makes speakers separable.</p>
+
+  <div class="grid2" style="margin-top:5px">
+    <div class="card"><h3>Why it doesn’t fragment</h3>
+      Clustering sees many turns with a <b>broad view</b>, so an expressive speaker’s varied turns still group
+      together. Two safeguards clean the edges: an adjustable <b>clustering threshold</b>, and merging of tiny
+      low-evidence clusters into the nearest real voice.</div>
+    <div class="card"><h3>Known vs unknown speaker count</h3>
+      Telling the model the exact count (<span class="kw">--speakers N</span>) is most reliable. Otherwise it
+      estimates the count — convenient but never perfect for every recording (an inherent limitation).</div>
+  </div>
+
+  <div class="foot">Live Speaker Diarization · Complete Project Guide · Page 1 of 3</div>
+</div>
+
+<!-- ============ PAGE 2 ============ -->
+<div class="page pb">
+  <h2>3 · Going Live — The Real-Time Architecture</h2>
+  <div class="lead">A live stream never ends, so you can’t re-process the past. Instead we keep a short
+  <b>rolling buffer</b> of recent audio, re-diarize it on a fixed cadence, and use a <b>persistent speaker
+  registry</b> to keep IDs stable. Ingestion and compute are <b>decoupled by a thread</b> so latency stays bounded.</div>
+
+  <svg viewBox="0 0 760 210" width="720">
+    <defs>
+      <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5b6b7f"/></marker>
+      <style>.bx2{rx:7;stroke:#c9d4e0;stroke-width:1.2}.t2{font:600 9.5px -apple-system,Arial;fill:#12233b}.s2{font:8.2px ui-monospace,Menlo;fill:#5b6b7f}.ln2{stroke:#5b6b7f;stroke-width:1.3;fill:none;marker-end:url(#ar2)}.dl{stroke:#9aa7b6;stroke-width:1;stroke-dasharray:3 3;fill:none}</style>
+    </defs>
+    <rect class="bx2" x="8" y="10" width="210" height="40" fill="#e8f0fe"/><text class="t2" x="20" y="27">Source → ffmpeg (16 kHz PCM)</text><text class="s2" x="20" y="41">YouTube live / HLS / RTMP / SRT / file</text>
+    <rect class="bx2" x="8" y="66" width="210" height="38" fill="#e8f0fe"/><text class="t2" x="20" y="83">Reader thread (real-time)</text><text class="s2" x="20" y="97">append → trim to window</text>
+    <rect class="bx2" x="8" y="120" width="210" height="34" fill="#eaf0f7"/><text class="t2" x="20" y="141">Rolling buffer (~15 s, shared)</text>
+    <path class="ln2" d="M113,50 L113,64"/><path class="ln2" d="M113,104 L113,118"/>
+
+    <rect class="bx2" x="300" y="14" width="180" height="32" fill="#e7f7ee"/><text class="t2" x="312" y="34">every stride (~2 s): latest window</text>
+    <rect class="bx2" x="300" y="60" width="180" height="32" fill="#e7f7ee"/><text class="t2" x="312" y="80">diarize + embeddings</text>
+    <rect class="bx2" x="300" y="106" width="180" height="34" fill="#fdf0e3"/><text class="t2" x="312" y="122">registry match → stable ID</text><text class="s2" x="312" y="135">current = majority in last 3 s</text>
+    <rect class="bx2" x="300" y="154" width="180" height="32" fill="#f3e9fb"/><text class="t2" x="312" y="174">debounce → emit change</text>
+    <path class="ln2" d="M218,135 L298,120"/><path class="ln2" d="M390,46 L390,58"/><path class="ln2" d="M390,92 L390,104"/><path class="ln2" d="M390,140 L390,152"/>
+    <path class="dl" d="M480,30 L560,30 L560,170 L482,170"/><text class="s2" x="520" y="96">skip-ahead</text><text class="s2" x="520" y="108">if behind</text>
+
+    <rect class="bx2" x="600" y="60" width="152" height="92" fill="#fff"/><text class="t2" x="612" y="77">Speaker registry</text><text class="s2" x="612" y="92">cos(new, centroids)</text><text class="s2" x="612" y="105">≥0.30 → same ID</text><text class="s2" x="612" y="118">&lt;0.30 → new ID</text><text class="s2" x="612" y="131">EMA-update centroid</text>
+    <path class="dl" d="M480,76 L598,100"/>
+  </svg>
+  <p class="cap">Fig. 2 — Real-time engine. The reader thread never blocks on compute; the main loop always diarizes the newest window and skips ahead if slow, so latency is bounded.</p>
+
+  <div class="grid2">
+    <div class="card"><h3>The speaker registry (the heart)</h3>
+      Each re-diarization invents fresh local labels. The registry pins identity to the <b>voice fingerprint</b>:
+      a new cluster is matched to the most-similar stored centroid (cosine ≥ <span class="kw">0.30</span>) and
+      keeps that stable ID; otherwise it becomes a new speaker. Centroids update with an EMA, absorbing natural
+      variation. This is what defeats label permutation live.</div>
+    <div class="card"><h3>Bounded-latency scheduling</h3>
+      On an Apple M1 GPU a 15 s window re-diarizes in ~<b>1.4 s</b> — well under the 2 s stride, so it keeps pace.
+      If a stride ever runs long, the loop simply diarizes less often instead of piling up a backlog. A short
+      <b>debounce</b> (same speaker for ≥2 strides) suppresses spurious flips.</div>
+  </div>
+
+  <h2>4 · Ingestion — Getting Live Audio In</h2>
+  <table>
+    <tr><th>Source</th><th>How</th></tr>
+    <tr><td><b>Direct stream</b> (HLS <span class="kw">.m3u8</span> / RTMP / SRT / internet radio)</td><td>fed straight to <span class="kw">ffmpeg</span> → 16 kHz mono PCM. No scraping. This is the production path (e.g. a broadcast encoder feed).</td></tr>
+    <tr><td><b>Local file</b> (<span class="kw">--simulate</span>)</td><td>replayed at 1× real-time through the identical pipeline — the best first test, fully offline.</td></tr>
+    <tr><td><b>Live YouTube URL</b></td><td><span class="kw">yt-dlp</span> resolves the live HLS manifest; YouTube’s anti-bot JS challenge requires browser cookies + a JS runtime + yt-dlp’s solver (advanced, opt-in).</td></tr>
+  </table>
+
+  <div class="foot">Live Speaker Diarization · Complete Project Guide · Page 2 of 3</div>
+</div>
+
+<!-- ============ PAGE 3 ============ -->
+<div class="page pb">
+  <h2>5 · All Parameters &amp; Defaults</h2>
+  <table>
+    <tr><th>Parameter</th><th>Default</th><th>Role</th><th>What it controls</th></tr>
+    <tr><td>Sample rate</td><td>16 kHz mono</td><td>input</td><td>required audio format</td></tr>
+    <tr><td><span class="kw">segmentation window</span></td><td>10.0 s</td><td>pyannote internal</td><td>the neural analysis “chunk”</td></tr>
+    <tr><td><span class="kw">segmentation step</span></td><td>1.0 s</td><td>pyannote internal</td><td>hop between chunks (90% overlap)</td></tr>
+    <tr><td><span class="kw">embedding dim</span></td><td>256</td><td>pyannote internal</td><td>voice fingerprint size</td></tr>
+    <tr><td><span class="kw">window</span></td><td>15 s</td><td><b>live knob</b></td><td>rolling buffer length (context per pass)</td></tr>
+    <tr><td><span class="kw">stride</span></td><td>2 s</td><td><b>live knob</b></td><td>re-diarize cadence (latency vs compute)</td></tr>
+    <tr><td><span class="kw">clustering threshold</span></td><td>0.85</td><td><b>tuning knob</b></td><td>merge aggressiveness (over-split vs merge)</td></tr>
+    <tr><td><span class="kw">num_speakers</span></td><td><i>auto</i></td><td><b>tuning knob</b></td><td>set a known count for best accuracy</td></tr>
+    <tr><td><span class="kw">registry match_sim</span></td><td>0.30</td><td>registry</td><td>same-voice cosine cutoff (same≈0.83, diff≈0.10)</td></tr>
+    <tr><td><span class="kw">warmup / recent / confirm</span></td><td>8 s / 3 s / 2</td><td>live</td><td>startup gate · recency for “current” · anti-flip debounce</td></tr>
+  </table>
+
+  <h2>6 · Running It</h2>
+  <pre>python live_diarize.py sample.wav --simulate                 # simulated live (no network)
+python live_diarize.py "https://.../live.mp3" --max-seconds 60   # direct stream
+python live_diarize.py "https://youtube.com/watch?v=ID" \       # live YouTube (advanced)
+    --cookies-from-browser chrome --js-runtime deno --remote-components ejs:npm</pre>
+  <p style="margin:3px 0">Live output (any mode):</p>
+  <pre>[wall   10.0s | stream    9.5s]  * SPEAKER 1  [NEW VOICE]
+[wall   40.1s | stream   39.5s]  * SPEAKER 2
+  speakers seen: 2 [1, 2]   changes: 2</pre>
+
+  <h2>7 · Performance (measured)</h2>
+  <div class="grid3">
+    <div class="card"><h3>Real-time</h3>~1.4 s compute per 15 s window on a laptop GPU (Apple M1); keeps pace with the live edge at a 2 s stride.</div>
+    <div class="card"><h3>Accurate</h3>Online result ≈ <b>96%</b> frame-agreement vs the offline (whole-file) gold — no fragmentation.</div>
+    <div class="card"><h3>Portable</h3>Auto-uses NVIDIA CUDA, Apple MPS, or CPU. GPU strongly recommended for real-time.</div>
+  </div>
+
+  <h2>8 · Requirements &amp; Honest Limitations</h2>
+  <ul>
+    <li><b>GPU:</b> NVIDIA CUDA (or Apple MPS) for real-time; CPU can’t keep up. Install a <b>matched</b> torch + torchaudio pair (same version, same CUDA index).</li>
+    <li><b>Model access:</b> free Hugging Face token + accept the <span class="kw">pyannote/speaker-diarization-community-1</span> terms once; weights cache locally.</li>
+    <li><b>Latency:</b> a few seconds after a real change (buffer fill + confirmation) — tunable via <span class="kw">stride</span>/<span class="kw">window</span>.</li>
+    <li><b>Unknown count:</b> no single threshold is perfect for every stream — prefer <span class="kw">--speakers N</span> when known.</li>
+    <li><b>Overlap:</b> when people talk at once, each instant is attributed to one speaker.</li>
+    <li><b>YouTube live:</b> depends on yt-dlp getting past YouTube’s anti-bot challenge; direct stream feeds avoid this entirely.</li>
+  </ul>
+
+  <p style="margin-top:6px"><b>Stack:</b> <span class="kw">pyannote-audio 4</span> · <span class="kw">community-1</span> ·
+  wespeaker 256-d embeddings · <span class="kw">VBx</span> clustering · <span class="kw">PyTorch</span> (CUDA/MPS) ·
+  <span class="kw">ffmpeg</span> · <span class="kw">yt-dlp</span> — all open-source, no paid APIs, no cloud.</p>
+
+  <div class="foot">Live Speaker Diarization · Complete Project Guide · Page 3 of 3 · “who speaks, when — live”</div>
+</div>
+
+</body></html>

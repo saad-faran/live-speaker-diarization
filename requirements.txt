@@ -1,0 +1,13 @@
+# Core dependencies.
+#
+# IMPORTANT: install PyTorch + torchaudio FIRST, TOGETHER, from the SAME CUDA index
+# (see README step 2). They are intentionally NOT listed here, because pip would
+# otherwise pull CPU-only wheels from PyPI and mismatch your CUDA torch version
+# (torch and torchaudio MUST share the exact same version number).
+pyannote.audio>=4.0
+soundfile>=0.12
+numpy>=1.24
+python-dotenv>=1.0
+
+# Needed to diarize a YouTube/other web stream (not needed for --simulate or direct HLS/RTMP):
+yt-dlp

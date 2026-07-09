@@ -1,0 +1,27 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# generated / temp audio
+*_16k.wav
+_dl.*
+_sim*.wav
+
+# audio / model artifacts
+*.wav
+*.mp3
+*.m4a
+*.webm
+models/
+*.ckpt
+*.bin
+
+# os
+.DS_Store
+Thumbs.db
