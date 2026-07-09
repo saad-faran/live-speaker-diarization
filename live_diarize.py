@@ -30,9 +30,16 @@ import sys
 import time
 import shutil
 import subprocess
+import json
+import pathlib
+import warnings
 import argparse
 import threading
+import webbrowser
 import numpy as np
+
+warnings.filterwarnings("ignore")            # silence pyannote/torch/numpy noise
+np.seterr(invalid="ignore", divide="ignore")
 
 # --- make output robust on Windows terminals (UTF-8 + ANSI colors) ---
 if os.name == "nt":
@@ -50,6 +57,48 @@ from core import load_pipeline, SpeakerRegistry, pick_device
 SR = 16000
 COL = ["\033[94m", "\033[92m", "\033[91m", "\033[93m", "\033[95m", "\033[96m"]
 RESET = "\033[0m"
+PALETTE_HEX = ["#3498DB", "#2ECC71", "#E74C3C", "#F39C12", "#9B59B6",
+               "#1ABC9C", "#E91E63", "#FF9800", "#34495E", "#16A085"]
+
+
+def _fmt(t):
+    return f"{int(t // 60):02d}:{int(t % 60):02d}"
+
+
+def build_html(events, total, out_path, title="Live Speaker Timeline"):
+    """Render a self-contained colored-timeline HTML from speaker-change events.
+    events: list of (stream_time_sec, stable_id, is_new)."""
+    blocks = []
+    for i, (t, sid, _) in enumerate(events):
+        end = events[i + 1][0] if i + 1 < len(events) else total
+        if end > t:
+            blocks.append((t, end, sid))
+    color = {sid: PALETTE_HEX[(sid - 1) % len(PALETTE_HEX)]
+             for sid in sorted(set(b[2] for b in blocks))}
+    bars = "".join(
+        f'<div title="SPEAKER {sid}: {_fmt(s)}-{_fmt(e)}" style="display:inline-block;'
+        f'width:{max((e - s) / total * 100, 0.05):.3f}%;height:60px;background:{color[sid]};'
+        f'vertical-align:top;border-right:1px solid rgba(0,0,0,.15)"></div>'
+        for s, e, sid in blocks)
+    chips = "".join(
+        f'<span style="background:{c};color:#fff;padding:4px 12px;border-radius:16px;'
+        f'font:600 13px sans-serif;margin:3px">SPEAKER {sid}</span>' for sid, c in color.items())
+    axis = "".join(f"<span>{_fmt(total * i / 8)}</span>" for i in range(9))
+    rows = "".join(
+        f'<tr><td>{i + 1}</td><td>{_fmt(s)}</td><td>{_fmt(e)}</td><td>{e - s:.1f}s</td>'
+        f'<td style=color:{color[sid]}>SPEAKER {sid}</td></tr>'
+        for i, (s, e, sid) in enumerate(blocks))
+    html = f"""<!doctype html><meta charset=utf-8>
+<body style="background:#0d0d1f;color:#eee;font-family:sans-serif;padding:26px">
+<h2>{title} — {len(color)} speaker(s), {len(blocks)} changes over {_fmt(total)}</h2>
+<div style="width:100%;border-radius:10px;overflow:hidden;border:1px solid #333">{bars}</div>
+<div style="display:flex;justify-content:space-between;color:#888;font:11px monospace;margin-top:4px">{axis}</div>
+<div style="margin-top:16px">{chips}</div>
+<table style="margin-top:20px;border-collapse:collapse;font:13px monospace">
+<tr style="color:#888"><td>#</td><td>start</td><td>end</td><td>dur</td><td>speaker</td></tr>
+{rows}</table></body>"""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
 
 def _tool(name):
@@ -258,10 +307,10 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
-    n = [0]
+    events = []
 
     def on_change(sid, is_new, stream_t, wall):
-        n[0] += 1
+        events.append((stream_t, sid, is_new))
         c = COL[(sid - 1) % len(COL)]
         tag = "  [NEW VOICE]" if is_new else ""
         print(f"[wall {wall:6.1f}s | stream {stream_t:6.1f}s]  {c}* SPEAKER {sid}{RESET}{tag}", flush=True)
@@ -272,8 +321,24 @@ def main():
         pass
     finally:
         ld.stop = True
+        total = ld.total / SR
         spk = sorted(ld.reg.centroids.keys())
-        print(f"\n{'=' * 50}\n  speakers seen: {len(spk)} {spk}   changes: {n[0]}\n{'=' * 50}", flush=True)
+        print(f"\n{'=' * 50}\n  speakers seen: {len(spk)} {spk}   changes: {len(events)}\n{'=' * 50}", flush=True)
+        if events:
+            out_html = os.path.join(os.getcwd(), "live_timeline.html")
+            out_json = os.path.join(os.getcwd(), "live_result.json")
+            build_html(events, total, out_html)
+            blocks = [[round(events[i][0], 1),
+                       round(events[i + 1][0] if i + 1 < len(events) else total, 1),
+                       events[i][1]] for i in range(len(events))]
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump({"n_speakers": len(spk), "n_changes": len(events),
+                           "duration_sec": round(total, 1), "timeline": blocks}, f, indent=2)
+            print(f"  HTML timeline: {out_html}\n  JSON: {out_json}", flush=True)
+            try:
+                webbrowser.open(pathlib.Path(out_html).resolve().as_uri())
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
