@@ -11,3 +11,10 @@ python-dotenv>=1.0
 
 # Needed to diarize a YouTube/other web stream (not needed for --simulate or direct HLS/RTMP):
 yt-dlp
+
+# Video overlay (burn speaker labels onto video):
+Pillow>=9.0
+
+# Optional — background-music removal before diarizing (--separate-vocals).
+# Heavy; needs a GPU to be practical. Install only if you need it:
+#   pip install demucs

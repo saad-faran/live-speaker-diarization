@@ -161,6 +161,26 @@ runs — then emits whoever is talking now. If compute falls behind it just diar
 so latency never accumulates. Full details, diagrams, and all parameters:
 **[`docs/project_overview.pdf`](docs/project_overview.pdf)**.
 
+## Video overlay & background-music removal
+
+**See the labels on the video** (`--overlay`) — instead of only reading logs, get a video
+with the speaker label burned in, synced to who's talking, for easy audiovisual checking:
+```bash
+python live_diarize.py "https://www.youtube.com/watch?v=<ID>" --overlay          # downloads the video
+python live_diarize.py local_video.mp4 --overlay --speakers 3
+```
+Produces `live_labeled.mp4` (labels burned on) **plus** the usual `live_timeline.html` + JSON.
+Uses PIL + ffmpeg's `overlay` filter, so it needs no special ffmpeg build.
+
+**Strip background music** before diarizing (`--separate-vocals`) — isolates vocals with
+[Demucs](https://github.com/facebookresearch/demucs) so music doesn't contaminate speaker
+embeddings (dramas, broadcasts, songs):
+```bash
+pip install demucs
+python live_diarize.py video.mp4 --overlay --separate-vocals --speakers 3
+```
+Demucs is heavy — practical on an NVIDIA GPU; slow on CPU/MPS. Best combined with `--speakers N`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Model weights are governed by their own licenses on Hugging Face.

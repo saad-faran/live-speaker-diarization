@@ -119,6 +119,20 @@ def to_16k_mono_wav(path):
     return out
 
 
+def download_video(url, out, cookies=None, js=None, remote=None):
+    """Download a YouTube (or other) video with audio, as an mp4."""
+    ytdlp = _tool("yt-dlp")
+    cmd = [ytdlp, "--no-warnings", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out]
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    if js:
+        cmd += ["--js-runtimes", js]
+    if remote:
+        cmd += ["--remote-components", remote]
+    subprocess.run(cmd + [url], check=True)
+    return out
+
+
 def _fmt(t):
     return f"{int(t // 60):02d}:{int(t % 60):02d}"
 
@@ -312,6 +326,73 @@ class LiveDiarizer:
             self.process(buf, total / SR, flush=True)
 
 
+def _run_over_audio(ld, audio, stride):
+    """Drive the live engine over an in-memory audio array (file/overlay mode)."""
+    win_n, stride_n = ld.win_n, int(stride * SR)
+    end = stride_n
+    while end <= len(audio):
+        buf = audio[max(0, end - win_n):end]
+        if len(buf) >= ld.warmup_n:
+            ld.process(buf, end / SR)
+        end += stride_n
+    ld.process(audio[max(0, len(audio) - win_n):len(audio)], len(audio) / SR, flush=True)
+
+
+def _write_outputs(blocks, total, tag):
+    spk = sorted(set(b[2] for b in blocks))
+    n_changes = sum(1 for i in range(1, len(blocks)) if blocks[i][2] != blocks[i - 1][2])
+    print(f"\n  {tag}: {len(spk)} speakers, {len(blocks)} turns, {n_changes} changes", flush=True)
+    out_html = os.path.join(os.getcwd(), "live_timeline.html")
+    out_json = os.path.join(os.getcwd(), "live_result.json")
+    build_html(blocks, total, out_html)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump({"n_speakers": len(spk), "n_changes": n_changes, "duration_sec": round(total, 1),
+                   "timeline": [[round(s, 2), round(e, 2), sid] for s, e, sid in blocks]}, f, indent=2)
+    return out_html, out_json
+
+
+def overlay_mode(args):
+    """URL/local video -> diarize its audio with the LIVE engine -> burn speaker labels."""
+    import soundfile as sf
+    import overlay
+    cwd = os.getcwd()
+    if os.path.exists(args.input):
+        video = args.input
+    else:
+        print("-> downloading video...", flush=True)
+        video = download_video(args.input, os.path.join(cwd, "video.mp4"),
+                               args.cookies_from_browser, args.js_runtime, args.remote_components)
+    wav = os.path.join(cwd, "_ov_audio.wav")
+    subprocess.run([_tool("ffmpeg"), "-y", "-i", video, "-ac", "1", "-ar", str(SR), wav],
+                   check=True, capture_output=True)
+    audio, _ = sf.read(wav, dtype="float32")
+    device = pick_device()
+    if args.separate_vocals:
+        import separate
+        if not separate.available():
+            sys.exit("Demucs not installed. Run: pip install demucs")
+        print("-> separating vocals (Demucs)... this can take a while", flush=True)
+        audio = separate.separate_vocals(audio, device=device)
+
+    print(f"-> diarizing (live engine) on {device.upper()}...", flush=True)
+    ld = LiveDiarizer(window=args.window, stride=args.stride,
+                      commit_lag=args.commit_lag, threshold=args.threshold)
+    _run_over_audio(ld, audio, args.stride)
+    blocks = (ld.finalize_global(num_speakers=args.speakers) if args.speakers
+              else ld.finalize_global() if args.global_labels else ld.finalize())
+    total = len(audio) / SR
+    _write_outputs(blocks, total, "LIVE (overlay)")
+
+    print("-> burning speaker labels onto the video...", flush=True)
+    out_mp4 = os.path.join(cwd, "live_labeled.mp4")
+    overlay.burn(video, blocks, out_mp4)
+    print(f"  labeled video: {out_mp4}\n  HTML: {os.path.join(cwd, 'live_timeline.html')}", flush=True)
+    try:
+        webbrowser.open(pathlib.Path(out_mp4).resolve().as_uri())
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="Real-time speaker diarization of a live stream.")
     ap.add_argument("input", help="local file (with --simulate), or a live stream URL")
@@ -327,12 +408,21 @@ def main():
                     help="label turns by global re-clustering of all embeddings (auto count) "
                          "instead of the online registry")
     ap.add_argument("--max-seconds", type=float, default=None, help="auto-stop after N seconds")
+    ap.add_argument("--overlay", action="store_true",
+                    help="download the video (or use a local video), diarize its audio, and "
+                         "burn speaker labels onto the video for audiovisual verification")
+    ap.add_argument("--separate-vocals", action="store_true",
+                    help="strip background music with Demucs before diarizing (music-heavy audio)")
     ap.add_argument("--cookies-from-browser", default=None,
                     help="chrome|edge|firefox — auth to bypass YouTube's bot check")
     ap.add_argument("--js-runtime", default=None, help="JS runtime for yt-dlp (node|deno)")
     ap.add_argument("--remote-components", default=None,
                     help="e.g. ejs:npm — let yt-dlp fetch YouTube's JS challenge solver")
     args = ap.parse_args()
+
+    if args.overlay:
+        overlay_mode(args)
+        return
 
     ld = LiveDiarizer(window=args.window, stride=args.stride, commit_lag=args.commit_lag,
                       threshold=args.threshold)
@@ -345,6 +435,12 @@ def main():
         if info.samplerate != SR or info.channels != 1:
             wav = to_16k_mono_wav(args.input)
         audio, _ = sf.read(wav, dtype="float32")
+        if args.separate_vocals:
+            import separate
+            if not separate.available():
+                sys.exit("Demucs not installed. Run: pip install demucs")
+            print("-> separating vocals (Demucs)...", flush=True)
+            audio = separate.separate_vocals(audio, device=pick_device())
         print(f"-> SIMULATING live stream from {args.input} ({len(audio)/SR:.0f}s) at 1x\n", flush=True)
 
         def reader():
