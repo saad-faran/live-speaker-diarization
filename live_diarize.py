@@ -15,14 +15,17 @@ live_diarize.py — REAL-TIME speaker diarization of a live stream.
     # bounded run (auto-stop after N seconds):
     python live_diarize.py <input> --max-seconds 60
 
-Design (bounded-latency real-time)
-----------------------------------
+Design (bounded-latency real-time, boundary-accurate)
+-----------------------------------------------------
     source -> ffmpeg (16 kHz mono s16le PCM)
        -> [reader thread]  fills a rolling buffer at real-time rate
-       -> [main loop]      every `stride`s, diarizes the LATEST `window`s, maps clusters
-                           to a persistent speaker registry, and emits who is talking now.
-                           If compute falls behind it simply diarizes less often
-                           (skips ahead) — latency never accumulates.
+       -> [main loop]      every `stride`s, diarizes the LATEST `window`s. It COMMITS the
+                           fine-grained speaker turns in the region that is now settled
+                           (older than `commit_lag`), mapping each to a persistent speaker
+                           registry. The committed turns are post-processed exactly like the
+                           offline tool (merge + min-duration), so speaker-CHANGE timestamps
+                           track the offline boundaries. If compute falls behind, it commits
+                           less often (skips ahead) — latency never accumulates.
 Runs on NVIDIA CUDA, Apple MPS, or CPU (auto-selected).
 """
 import os
@@ -61,46 +64,6 @@ PALETTE_HEX = ["#3498DB", "#2ECC71", "#E74C3C", "#F39C12", "#9B59B6",
                "#1ABC9C", "#E91E63", "#FF9800", "#34495E", "#16A085"]
 
 
-def _fmt(t):
-    return f"{int(t // 60):02d}:{int(t % 60):02d}"
-
-
-def build_html(events, total, out_path, title="Live Speaker Timeline"):
-    """Render a self-contained colored-timeline HTML from speaker-change events.
-    events: list of (stream_time_sec, stable_id, is_new)."""
-    blocks = []
-    for i, (t, sid, _) in enumerate(events):
-        end = events[i + 1][0] if i + 1 < len(events) else total
-        if end > t:
-            blocks.append((t, end, sid))
-    color = {sid: PALETTE_HEX[(sid - 1) % len(PALETTE_HEX)]
-             for sid in sorted(set(b[2] for b in blocks))}
-    bars = "".join(
-        f'<div title="SPEAKER {sid}: {_fmt(s)}-{_fmt(e)}" style="display:inline-block;'
-        f'width:{max((e - s) / total * 100, 0.05):.3f}%;height:60px;background:{color[sid]};'
-        f'vertical-align:top;border-right:1px solid rgba(0,0,0,.15)"></div>'
-        for s, e, sid in blocks)
-    chips = "".join(
-        f'<span style="background:{c};color:#fff;padding:4px 12px;border-radius:16px;'
-        f'font:600 13px sans-serif;margin:3px">SPEAKER {sid}</span>' for sid, c in color.items())
-    axis = "".join(f"<span>{_fmt(total * i / 8)}</span>" for i in range(9))
-    rows = "".join(
-        f'<tr><td>{i + 1}</td><td>{_fmt(s)}</td><td>{_fmt(e)}</td><td>{e - s:.1f}s</td>'
-        f'<td style=color:{color[sid]}>SPEAKER {sid}</td></tr>'
-        for i, (s, e, sid) in enumerate(blocks))
-    html = f"""<!doctype html><meta charset=utf-8>
-<body style="background:#0d0d1f;color:#eee;font-family:sans-serif;padding:26px">
-<h2>{title} — {len(color)} speaker(s), {len(blocks)} changes over {_fmt(total)}</h2>
-<div style="width:100%;border-radius:10px;overflow:hidden;border:1px solid #333">{bars}</div>
-<div style="display:flex;justify-content:space-between;color:#888;font:11px monospace;margin-top:4px">{axis}</div>
-<div style="margin-top:16px">{chips}</div>
-<table style="margin-top:20px;border-collapse:collapse;font:13px monospace">
-<tr style="color:#888"><td>#</td><td>start</td><td>end</td><td>dur</td><td>speaker</td></tr>
-{rows}</table></body>"""
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-
 def _tool(name):
     exe = shutil.which(name)
     if not exe:
@@ -111,7 +74,7 @@ def _tool(name):
 def is_direct_stream(url):
     """A URL ffmpeg can read directly (no yt-dlp needed)."""
     u = url.lower()
-    return (u.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "rtp://", "http://", "https://"))
+    return (u.startswith(("http://", "https://"))
             and (".m3u8" in u or u.endswith((".ts", ".flv", ".aac", ".mp3", ".wav")))) \
         or u.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "rtp://"))
 
@@ -129,7 +92,6 @@ def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_compo
         base += ["--js-runtimes", js_runtime]
     if remote_components:
         base += ["--remote-components", remote_components]
-
     last_err = ""
     for fmt in ["91", "bestaudio/best"]:           # 91 = YouTube live HLS (audio-cheap)
         try:
@@ -157,11 +119,48 @@ def to_16k_mono_wav(path):
     return out
 
 
+def _fmt(t):
+    return f"{int(t // 60):02d}:{int(t % 60):02d}"
+
+
+def build_html(blocks, total, out_path, title="Live Speaker Timeline"):
+    """Self-contained colored-timeline HTML (same layout as the offline tool).
+    blocks: list of (start_sec, end_sec, stable_id)."""
+    color = {sid: PALETTE_HEX[(sid - 1) % len(PALETTE_HEX)]
+             for sid in sorted(set(b[2] for b in blocks))}
+    bars = "".join(
+        f'<div title="SPEAKER {sid}: {_fmt(s)}-{_fmt(e)}" style="display:inline-block;'
+        f'width:{max((e - s) / total * 100, 0.05):.3f}%;height:60px;background:{color[sid]};'
+        f'vertical-align:top;border-right:1px solid rgba(0,0,0,.15)"></div>'
+        for s, e, sid in blocks)
+    chips = "".join(
+        f'<span style="background:{c};color:#fff;padding:4px 12px;border-radius:16px;'
+        f'font:600 13px sans-serif;margin:3px">SPEAKER {sid}</span>' for sid, c in color.items())
+    axis = "".join(f"<span>{_fmt(total * i / 8)}</span>" for i in range(9))
+    rows = "".join(
+        f'<tr><td>{i + 1}</td><td>{_fmt(s)}</td><td>{_fmt(e)}</td><td>{e - s:.1f}s</td>'
+        f'<td style=color:{color[sid]}>SPEAKER {sid}</td></tr>'
+        for i, (s, e, sid) in enumerate(blocks))
+    n_changes = sum(1 for i in range(1, len(blocks)) if blocks[i][2] != blocks[i - 1][2])
+    html = f"""<!doctype html><meta charset=utf-8>
+<body style="background:#0d0d1f;color:#eee;font-family:sans-serif;padding:26px">
+<h2>{title} — {len(color)} speaker(s), {n_changes} changes over {_fmt(total)}</h2>
+<div style="width:100%;border-radius:10px;overflow:hidden;border:1px solid #333">{bars}</div>
+<div style="display:flex;justify-content:space-between;color:#888;font:11px monospace;margin-top:4px">{axis}</div>
+<div style="margin-top:16px">{chips}</div>
+<table style="margin-top:20px;border-collapse:collapse;font:13px monospace">
+<tr style="color:#888"><td>#</td><td>start</td><td>end</td><td>dur</td><td>speaker</td></tr>
+{rows}</table></body>"""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
 class LiveDiarizer:
-    """Rolling-buffer + speaker-registry engine with bounded-latency scheduling."""
+    """Rolling-buffer + speaker-registry engine that commits fine-grained turn boundaries."""
 
     def __init__(self, window=15.0, stride=2.0, threshold=0.85, num_speakers=None,
-                 warmup=8.0, match_sim=0.30, recent=3.0, confirm=2):
+                 warmup=8.0, match_sim=0.30, commit_lag=2.0,
+                 min_change_dur=0.8, merge_gap=0.6):
         self.device = pick_device()
         print(f"-> loading diarizer (pyannote community-1 on {self.device.upper()})...", flush=True)
         self.pipe = load_pipeline(device=self.device,
@@ -171,12 +170,15 @@ class LiveDiarizer:
         self.stride = stride
         self.warmup_n = int(warmup * SR)
         self.num_speakers = num_speakers
-        self.recent = recent            # judge "current speaker" from the last `recent`s
-        self.confirm = confirm          # a change must persist this many strides before emitting
+        self.commit_lag = commit_lag        # only commit turns older than this (gives boundaries context)
+        self.min_change_dur = min_change_dur
+        self.merge_gap = merge_gap
         self.buf = np.zeros(0, dtype=np.float32)
-        self.total = 0                  # total samples ever received (= stream position)
+        self.total = 0                      # total samples ever received (= stream position)
         self.lock = threading.Lock()
         self.stop = False
+        self.raw = []                       # committed fine-grained (start, end, stable_id) turns
+        self.committed_until = 0.0          # absolute stream time already committed
 
     # ── ingestion ────────────────────────────────────────────────────────────
     def feed(self, samples):
@@ -190,38 +192,57 @@ class LiveDiarizer:
         with self.lock:
             return self.buf.copy(), self.total
 
-    # ── one diarization pass on the latest window -> current speaker ──────────
-    def _current_speaker(self, buf):
+    # ── diarize one window -> absolute-time turns mapped to stable IDs ────────
+    def _diarize_window(self, buf, buf_start):
         kw = {"num_speakers": self.num_speakers} if self.num_speakers else {}
         out = self.pipe({"waveform": torch.from_numpy(buf).unsqueeze(0), "sample_rate": SR}, **kw)
         if self.device == "mps":
-            torch.mps.empty_cache()     # prevent MPS memory accrual across strides
+            torch.mps.empty_cache()
         ann = out.exclusive_speaker_diarization
         embs = out.speaker_embeddings
         labels = ann.labels()
-        if not labels:
-            return None, False
         lab2emb = {l: (embs[i] if embs is not None and i < len(embs) else None)
                    for i, l in enumerate(labels)}
         mapping = self.reg.match(list(lab2emb.items()))
-        # current speaker = whoever speaks MOST in the last `recent`s (robust to backchannels)
-        win_end = len(buf) / SR
-        lo = win_end - self.recent
-        talk = {}
+        turns = []
         for turn, _, label in ann.itertracks(yield_label=True):
-            ov = min(turn.end, win_end) - max(turn.start, lo)
-            if ov > 0:
-                talk[label] = talk.get(label, 0.0) + ov
-        if not talk:
-            return None, False
-        label = max(talk, key=talk.get)
-        sid = mapping.get(label)
-        return sid, (self.reg.counts.get(sid, 0) <= 1)
+            sid = mapping.get(label)
+            if sid is not None:
+                turns.append((buf_start + turn.start, buf_start + turn.end, sid))
+        return turns
+
+    def process(self, buf, stream_end, flush=False):
+        """Commit the fine-grained turns that are now settled. Returns the newly
+        committed (start, end, stable_id) pieces. `flush` commits right up to stream_end."""
+        buf_start = stream_end - len(buf) / SR
+        commit_edge = stream_end if flush else stream_end - self.commit_lag
+        if commit_edge <= self.committed_until + 1e-3:
+            return []
+        turns = self._diarize_window(buf, buf_start)
+        new = []
+        lo, hi = self.committed_until, commit_edge
+        for s, e, sid in sorted(turns):
+            s2, e2 = max(s, lo), min(e, hi)
+            if e2 - s2 > 0:
+                self.raw.append((s2, e2, sid))
+                new.append((s2, e2, sid))
+        self.committed_until = commit_edge
+        return new
+
+    def finalize(self):
+        """Post-process committed turns exactly like the offline tool:
+        merge same-speaker within `merge_gap`, then drop turns < `min_change_dur`."""
+        merged = []
+        for s, e, sid in sorted(self.raw):
+            if merged and merged[-1][2] == sid and s - merged[-1][1] <= self.merge_gap:
+                merged[-1] = [merged[-1][0], max(merged[-1][1], e), sid]
+            else:
+                merged.append([s, e, sid])
+        return [(s, e, sid) for s, e, sid in merged if e - s >= self.min_change_dur]
 
     # ── main real-time loop ──────────────────────────────────────────────────
     def run(self, max_seconds=None, on_change=None):
-        cur = None
-        cand, cand_hits = None, 0
+        last_printed = None
         t0 = time.time()
         next_tick = t0 + self.stride
         while not self.stop:
@@ -231,21 +252,18 @@ class LiveDiarizer:
             if now < next_tick:
                 time.sleep(min(0.05, next_tick - now))
                 continue
-            next_tick = now + self.stride           # schedule next; skip-ahead if we were slow
+            next_tick = now + self.stride
             buf, total = self._snapshot()
             if len(buf) < self.warmup_n:
                 continue
-            sid, is_new = self._current_speaker(buf)
-            if sid is None:
-                continue
-            # debounce: require the same new speaker for `confirm` consecutive strides
-            cand_hits = cand_hits + 1 if sid == cand else 1
-            cand = sid
-            need = 1 if cur is None else self.confirm
-            if sid != cur and cand_hits >= need:
-                if on_change:
-                    on_change(sid, is_new, total / SR, now - t0)
-                cur = sid
+            for s, e, sid in self.process(buf, total / SR):
+                if on_change and (e - s) >= self.min_change_dur and sid != last_printed:
+                    on_change(sid, self.reg.counts.get(sid, 0) <= 1, s, now - t0)
+                    last_printed = sid
+        # flush the tail that was held back by commit_lag
+        buf, total = self._snapshot()
+        if len(buf) >= self.warmup_n:
+            self.process(buf, total / SR, flush=True)
 
 
 def main():
@@ -253,7 +271,9 @@ def main():
     ap.add_argument("input", help="local file (with --simulate), or a live stream URL")
     ap.add_argument("--simulate", action="store_true", help="replay a local file at 1x real-time")
     ap.add_argument("--window", type=float, default=15.0, help="rolling buffer length (s)")
-    ap.add_argument("--stride", type=float, default=2.0, help="re-diarize every N seconds")
+    ap.add_argument("--stride", type=float, default=2.0, help="commit cadence (s)")
+    ap.add_argument("--commit-lag", type=float, default=2.0,
+                    help="hold back the newest N s before committing (boundary context vs latency)")
     ap.add_argument("--threshold", type=float, default=0.85, help="clustering merge threshold")
     ap.add_argument("--speakers", type=int, default=None, help="force a known speaker count")
     ap.add_argument("--max-seconds", type=float, default=None, help="auto-stop after N seconds")
@@ -264,7 +284,7 @@ def main():
                     help="e.g. ejs:npm — let yt-dlp fetch YouTube's JS challenge solver")
     args = ap.parse_args()
 
-    ld = LiveDiarizer(window=args.window, stride=args.stride,
+    ld = LiveDiarizer(window=args.window, stride=args.stride, commit_lag=args.commit_lag,
                       threshold=args.threshold, num_speakers=args.speakers)
 
     # ── ingestion thread ─────────────────────────────────────────────────────
@@ -307,10 +327,7 @@ def main():
 
     threading.Thread(target=reader, daemon=True).start()
 
-    events = []
-
     def on_change(sid, is_new, stream_t, wall):
-        events.append((stream_t, sid, is_new))
         c = COL[(sid - 1) % len(COL)]
         tag = "  [NEW VOICE]" if is_new else ""
         print(f"[wall {wall:6.1f}s | stream {stream_t:6.1f}s]  {c}* SPEAKER {sid}{RESET}{tag}", flush=True)
@@ -321,19 +338,20 @@ def main():
         pass
     finally:
         ld.stop = True
-        total = ld.total / SR
-        spk = sorted(ld.reg.centroids.keys())
-        print(f"\n{'=' * 50}\n  speakers seen: {len(spk)} {spk}   changes: {len(events)}\n{'=' * 50}", flush=True)
-        if events:
+        blocks = ld.finalize()
+        total = ld.total / SR if ld.total else 1.0
+        spk = sorted(set(b[2] for b in blocks))
+        n_changes = sum(1 for i in range(1, len(blocks)) if blocks[i][2] != blocks[i - 1][2])
+        print(f"\n{'=' * 50}\n  speakers seen: {len(spk)} {spk}   turns: {len(blocks)}   changes: {n_changes}\n{'=' * 50}", flush=True)
+        if blocks:
             out_html = os.path.join(os.getcwd(), "live_timeline.html")
             out_json = os.path.join(os.getcwd(), "live_result.json")
-            build_html(events, total, out_html)
-            blocks = [[round(events[i][0], 1),
-                       round(events[i + 1][0] if i + 1 < len(events) else total, 1),
-                       events[i][1]] for i in range(len(events))]
+            build_html(blocks, total, out_html)
             with open(out_json, "w", encoding="utf-8") as f:
-                json.dump({"n_speakers": len(spk), "n_changes": len(events),
-                           "duration_sec": round(total, 1), "timeline": blocks}, f, indent=2)
+                json.dump({"n_speakers": len(spk), "n_changes": n_changes,
+                           "duration_sec": round(total, 1),
+                           "timeline": [[round(s, 2), round(e, 2), sid] for s, e, sid in blocks]},
+                          f, indent=2)
             print(f"  HTML timeline: {out_html}\n  JSON: {out_json}", flush=True)
             try:
                 webbrowser.open(pathlib.Path(out_html).resolve().as_uri())

@@ -117,12 +117,24 @@ Add `--max-seconds N` for a bounded test; press `Ctrl+C` to stop a live run.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--window` | `15` | rolling buffer length (s). Larger = more accurate, heavier. |
-| `--stride` | `2` | re-diarize every N s. Smaller = lower latency, more compute. |
+| `--window` | `15` | rolling buffer length (s). Larger = more context, heavier. |
+| `--stride` | `2` | commit cadence (s). Smaller = finer/lower latency, more compute. |
+| `--commit-lag` | `2` | hold back the newest N s before committing a boundary (more future context = sharper boundaries, slightly more latency). |
 | `--speakers` | auto | force a known speaker count (most reliable when you know it). |
-| `--threshold` | `0.85` | clustering merge threshold; raise if one speaker over-splits, lower if two merge. |
+| `--threshold` | `0.85` | clustering merge threshold. |
 
-Detection latency ≈ a few seconds after a real speaker change (buffer fill + confirmation).
+The engine commits the **fine-grained speaker turns** from each window's settled region
+(mapped to stable IDs) and post-processes them exactly like the offline tool, so
+speaker-**change timestamps track the offline boundaries closely** (validated: matched
+changes land within ~0.1 s of the offline reference). Detection is emitted a few seconds
+after the fact (buffer fill + `commit_lag`), but the *recorded* timestamp is the true
+boundary time.
+
+**Honest limit:** a speaker who appears only *briefly* with no other speech nearby in the
+rolling window (a 2–4 s interjection) can be mislabeled live — offline catches it only
+because that voice has minutes of evidence across the whole file. So expect the *matched*
+change-times to be near-exact, with a few short no-context interjections missed. Increasing
+`--window` gives more context and can help.
 Lower `--stride`/`--window` reduce it at the cost of compute.
 
 ---
