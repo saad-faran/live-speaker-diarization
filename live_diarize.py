@@ -158,18 +158,18 @@ def build_html(blocks, total, out_path, title="Live Speaker Timeline"):
 class LiveDiarizer:
     """Rolling-buffer + speaker-registry engine that commits fine-grained turn boundaries."""
 
-    def __init__(self, window=15.0, stride=2.0, threshold=0.85, num_speakers=None,
+    def __init__(self, window=15.0, stride=2.0, threshold=0.85,
                  warmup=8.0, match_sim=0.30, commit_lag=2.0,
                  min_change_dur=0.8, merge_gap=0.6):
         self.device = pick_device()
         print(f"-> loading diarizer (pyannote community-1 on {self.device.upper()})...", flush=True)
-        self.pipe = load_pipeline(device=self.device,
-                                  clustering_threshold=None if num_speakers else threshold)
+        # windows are ALWAYS diarized unconstrained (each 15s window has a variable, usually
+        # small speaker count) — a known cast count is applied later, to the GLOBAL clustering.
+        self.pipe = load_pipeline(device=self.device, clustering_threshold=threshold)
         self.reg = SpeakerRegistry(match_sim=match_sim)
         self.win_n = int(window * SR)
         self.stride = stride
         self.warmup_n = int(warmup * SR)
-        self.num_speakers = num_speakers
         self.commit_lag = commit_lag        # only commit turns older than this (gives boundaries context)
         self.min_change_dur = min_change_dur
         self.merge_gap = merge_gap
@@ -194,8 +194,7 @@ class LiveDiarizer:
 
     # ── diarize one window -> absolute-time turns mapped to stable IDs ────────
     def _diarize_window(self, buf, buf_start):
-        kw = {"num_speakers": self.num_speakers} if self.num_speakers else {}
-        out = self.pipe({"waveform": torch.from_numpy(buf).unsqueeze(0), "sample_rate": SR}, **kw)
+        out = self.pipe({"waveform": torch.from_numpy(buf).unsqueeze(0), "sample_rate": SR})
         if self.device == "mps":
             torch.mps.empty_cache()
         ann = out.exclusive_speaker_diarization
@@ -208,7 +207,7 @@ class LiveDiarizer:
         for turn, _, label in ann.itertracks(yield_label=True):
             sid = mapping.get(label)
             if sid is not None:
-                turns.append((buf_start + turn.start, buf_start + turn.end, sid))
+                turns.append((buf_start + turn.start, buf_start + turn.end, sid, lab2emb.get(label)))
         return turns
 
     def process(self, buf, stream_end, flush=False):
@@ -221,24 +220,71 @@ class LiveDiarizer:
         turns = self._diarize_window(buf, buf_start)
         new = []
         lo, hi = self.committed_until, commit_edge
-        for s, e, sid in sorted(turns):
+        for s, e, sid, emb in sorted(turns, key=lambda t: t[0]):
             s2, e2 = max(s, lo), min(e, hi)
             if e2 - s2 > 0:
-                self.raw.append((s2, e2, sid))
+                self.raw.append((s2, e2, sid, emb))
                 new.append((s2, e2, sid))
         self.committed_until = commit_edge
         return new
 
-    def finalize(self):
-        """Post-process committed turns exactly like the offline tool:
-        merge same-speaker within `merge_gap`, then drop turns < `min_change_dur`."""
+    @staticmethod
+    def _merge_relabel(turns, merge_gap, min_dur):
+        """turns: sorted list of (start, end, label) -> merged blocks with stable 1..N ids."""
+        remap, nxt = {}, 1
+        out = []
+        for s, e, lab in sorted(turns):
+            if lab not in remap:
+                remap[lab] = nxt
+                nxt += 1
+            out.append((s, e, remap[lab]))
         merged = []
-        for s, e, sid in sorted(self.raw):
-            if merged and merged[-1][2] == sid and s - merged[-1][1] <= self.merge_gap:
+        for s, e, sid in out:
+            if merged and merged[-1][2] == sid and s - merged[-1][1] <= merge_gap:
                 merged[-1] = [merged[-1][0], max(merged[-1][1], e), sid]
             else:
                 merged.append([s, e, sid])
-        return [(s, e, sid) for s, e, sid in merged if e - s >= self.min_change_dur]
+        return [(s, e, sid) for s, e, sid in merged if e - s >= min_dur]
+
+    def finalize(self):
+        """Registry labels (provisional, per-window). Fast but weaker on short turns."""
+        return self._merge_relabel([(s, e, sid) for s, e, sid, _ in self.raw],
+                                   self.merge_gap, self.min_change_dur)
+
+    def finalize_global(self, num_speakers=None, dist_threshold=0.55, min_speaker_dur=20.0):
+        """PRODUCTION labels: re-cluster ALL committed turn embeddings globally
+        (like the offline tool), so short turns are labeled using each speaker's full
+        evidence — not just one 15s window. Keeps the live-detected boundaries."""
+        from scipy.cluster.hierarchy import linkage, fcluster
+        items = [(s, e, emb) for (s, e, sid, emb) in self.raw
+                 if emb is not None and not np.isnan(emb).any()]
+        if len(items) < 3:
+            return self.finalize()
+        X = np.array([it[2] for it in items], dtype=float)
+        Z = linkage(X, method="average", metric="cosine")
+        if num_speakers:
+            lab = fcluster(Z, t=num_speakers, criterion="maxclust")
+        else:
+            lab = fcluster(Z, t=dist_threshold, criterion="distance")
+        # consolidate tiny clusters (< min_speaker_dur total) into nearest by centroid.
+        # SKIP when a count is explicitly requested — respect the given cast size.
+        dur = {}
+        for (s, e, _), c in zip(items, lab):
+            dur[c] = dur.get(c, 0.0) + (e - s)
+        centroid = {c: X[[i for i in range(len(lab)) if lab[i] == c]].mean(0) for c in set(lab)}
+        big = [c for c in dur if dur[c] >= min_speaker_dur]
+        if big and not num_speakers:
+            def _n(v):
+                return v / (np.linalg.norm(v) + 1e-9)
+            remap = {}
+            for c in dur:
+                if c in big:
+                    remap[c] = c
+                else:
+                    remap[c] = max(big, key=lambda b: float(_n(centroid[c]) @ _n(centroid[b])))
+            lab = [remap[c] for c in lab]
+        turns = [(items[i][0], items[i][1], int(lab[i])) for i in range(len(items))]
+        return self._merge_relabel(turns, self.merge_gap, self.min_change_dur)
 
     # ── main real-time loop ──────────────────────────────────────────────────
     def run(self, max_seconds=None, on_change=None):
@@ -275,7 +321,11 @@ def main():
     ap.add_argument("--commit-lag", type=float, default=2.0,
                     help="hold back the newest N s before committing (boundary context vs latency)")
     ap.add_argument("--threshold", type=float, default=0.85, help="clustering merge threshold")
-    ap.add_argument("--speakers", type=int, default=None, help="force a known speaker count")
+    ap.add_argument("--speakers", type=int, default=None,
+                    help="known cast size — applied to GLOBAL re-clustering (recommended when known)")
+    ap.add_argument("--global-labels", action="store_true",
+                    help="label turns by global re-clustering of all embeddings (auto count) "
+                         "instead of the online registry")
     ap.add_argument("--max-seconds", type=float, default=None, help="auto-stop after N seconds")
     ap.add_argument("--cookies-from-browser", default=None,
                     help="chrome|edge|firefox — auth to bypass YouTube's bot check")
@@ -285,7 +335,7 @@ def main():
     args = ap.parse_args()
 
     ld = LiveDiarizer(window=args.window, stride=args.stride, commit_lag=args.commit_lag,
-                      threshold=args.threshold, num_speakers=args.speakers)
+                      threshold=args.threshold)
 
     # ── ingestion thread ─────────────────────────────────────────────────────
     if args.simulate:
@@ -338,7 +388,12 @@ def main():
         pass
     finally:
         ld.stop = True
-        blocks = ld.finalize()
+        if args.speakers:                                    # known cast -> global clustering to N
+            blocks = ld.finalize_global(num_speakers=args.speakers)
+        elif args.global_labels:                             # opt-in auto global re-clustering
+            blocks = ld.finalize_global()
+        else:                                                # default: online registry (proven)
+            blocks = ld.finalize()
         total = ld.total / SR if ld.total else 1.0
         spk = sorted(set(b[2] for b in blocks))
         n_changes = sum(1 for i in range(1, len(blocks)) if blocks[i][2] != blocks[i - 1][2])
