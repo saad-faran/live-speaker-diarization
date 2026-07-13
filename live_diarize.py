@@ -172,9 +172,9 @@ def build_html(blocks, total, out_path, title="Live Speaker Timeline"):
 class LiveDiarizer:
     """Rolling-buffer + speaker-registry engine that commits fine-grained turn boundaries."""
 
-    def __init__(self, window=15.0, stride=2.0, threshold=0.85,
-                 warmup=8.0, match_sim=0.30, commit_lag=2.0,
-                 min_change_dur=0.8, merge_gap=0.6):
+    def __init__(self, window=15.0, stride=1.5, threshold=0.85,
+                 warmup=4.0, match_sim=0.30, commit_lag=1.0,
+                 min_change_dur=0.4, merge_gap=0.4):
         self.device = pick_device()
         print(f"-> loading diarizer (pyannote community-1 on {self.device.upper()})...", flush=True)
         # windows are ALWAYS diarized unconstrained (each 15s window has a variable, usually
@@ -376,7 +376,8 @@ def overlay_mode(args):
 
     print(f"-> diarizing (live engine) on {device.upper()}...", flush=True)
     ld = LiveDiarizer(window=args.window, stride=args.stride,
-                      commit_lag=args.commit_lag, threshold=args.threshold)
+                      commit_lag=args.commit_lag, threshold=args.threshold,
+                      min_change_dur=args.min_change_dur, match_sim=args.match_sim)
     _run_over_audio(ld, audio, args.stride)
     blocks = (ld.finalize_global(num_speakers=args.speakers) if args.speakers
               else ld.finalize_global() if args.global_labels else ld.finalize())
@@ -398,10 +399,16 @@ def main():
     ap.add_argument("input", help="local file (with --simulate), or a live stream URL")
     ap.add_argument("--simulate", action="store_true", help="replay a local file at 1x real-time")
     ap.add_argument("--window", type=float, default=15.0, help="rolling buffer length (s)")
-    ap.add_argument("--stride", type=float, default=2.0, help="commit cadence (s)")
-    ap.add_argument("--commit-lag", type=float, default=2.0,
-                    help="hold back the newest N s before committing (boundary context vs latency)")
-    ap.add_argument("--threshold", type=float, default=0.85, help="clustering merge threshold")
+    ap.add_argument("--stride", type=float, default=1.5, help="commit cadence (s) — lower = faster transitions")
+    ap.add_argument("--commit-lag", type=float, default=1.0,
+                    help="hold back the newest N s before committing (lower = faster, less boundary context)")
+    ap.add_argument("--threshold", type=float, default=0.85,
+                    help="per-window clustering threshold. LOWER (e.g. 0.5) to over-segment so "
+                         "short/quiet speakers become distinct; pair with --speakers N.")
+    ap.add_argument("--min-change-dur", type=float, default=0.4,
+                    help="drop turns shorter than this (s) — lower keeps very short interjections")
+    ap.add_argument("--match-sim", type=float, default=0.30,
+                    help="registry same-speaker cosine cutoff")
     ap.add_argument("--speakers", type=int, default=None,
                     help="known cast size — applied to GLOBAL re-clustering (recommended when known)")
     ap.add_argument("--global-labels", action="store_true",
@@ -425,7 +432,8 @@ def main():
         return
 
     ld = LiveDiarizer(window=args.window, stride=args.stride, commit_lag=args.commit_lag,
-                      threshold=args.threshold)
+                      threshold=args.threshold, min_change_dur=args.min_change_dur,
+                      match_sim=args.match_sim)
 
     # ── ingestion thread ─────────────────────────────────────────────────────
     if args.simulate:

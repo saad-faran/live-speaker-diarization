@@ -161,6 +161,21 @@ runs — then emits whoever is talking now. If compute falls behind it just diar
 so latency never accumulates. Full details, diagrams, and all parameters:
 **[`docs/project_overview.pdf`](docs/project_overview.pdf)**.
 
+## Getting every speaker (incl. short / quiet ones)
+
+For hard content (many speakers, short 1–3 s turns, background music) the defaults can miss or
+mislabel brief speakers. The recipe that fixes this:
+
+```bash
+python live_diarize.py <video-or-url> --overlay \
+    --speakers 4 --threshold 0.5 --separate-vocals
+```
+- **`--speakers N`** (real cast size) → globally re-clusters every turn to N consistent IDs and
+  skips small-cluster consolidation, so a speaker who only talks briefly still gets their own ID.
+- **`--threshold 0.5`** over-segments each window so short/quiet speakers become distinct.
+- **`--separate-vocals`** removes music that masks quiet speakers.
+- Lower **`--stride`/`--commit-lag`** (defaults 1.5 / 1.0) for faster, more real-time colour changes.
+
 ## Video overlay & background-music removal
 
 **See the labels on the video** (`--overlay`) — instead of only reading logs, get a video
