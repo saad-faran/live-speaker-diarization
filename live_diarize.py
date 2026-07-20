@@ -55,7 +55,7 @@ except Exception:
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 import torch
-from core import load_pipeline, SpeakerRegistry, pick_device, load_embedding_model, embed_segment
+from core import load_pipeline, SpeakerRegistry, pick_device
 
 SR = 16000
 COL = ["\033[94m", "\033[92m", "\033[91m", "\033[93m", "\033[95m", "\033[96m"]
@@ -180,7 +180,6 @@ class LiveDiarizer:
         # windows are ALWAYS diarized unconstrained (each 15s window has a variable, usually
         # small speaker count) — a known cast count is applied later, to the GLOBAL clustering.
         self.pipe = load_pipeline(device=self.device, clustering_threshold=threshold)
-        self.embedder = load_embedding_model(device=self.device)   # per-turn embeddings
         self.reg = SpeakerRegistry(match_sim=match_sim)
         self.win_n = int(window * SR)
         self.stride = stride
@@ -235,16 +234,9 @@ class LiveDiarizer:
         turns = self._diarize_window(buf, buf_start)
         new = []
         lo, hi = self.committed_until, commit_edge
-        for s, e, sid, winemb in sorted(turns, key=lambda t: t[0]):
+        for s, e, sid, emb in sorted(turns, key=lambda t: t[0]):
             s2, e2 = max(s, lo), min(e, hi)
             if e2 - s2 > 0:
-                # embed THIS turn's own audio (not the window cluster) so a short turn's
-                # identity comes from its voice, not whoever dominated the window.
-                i0, i1 = int((s2 - buf_start) * SR), int((e2 - buf_start) * SR)
-                seg = buf[max(0, i0):min(len(buf), i1)]
-                emb = embed_segment(self.embedder, seg)
-                if emb is None:
-                    emb = winemb
                 self.raw.append((s2, e2, sid, emb))
                 new.append((s2, e2, sid))
         self.committed_until = commit_edge
