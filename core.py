@@ -55,6 +55,35 @@ def load_pipeline(device=None, token=None, clustering_threshold=None):
     return pipe
 
 
+_EMB = None
+
+
+def load_embedding_model(device=None, token=None):
+    """Standalone speaker-embedding model (wespeaker 256-d) to embed ANY audio segment
+    on its own — so a short turn's identity comes from ITS voice, not the window's cluster."""
+    global _EMB
+    if _EMB is None:
+        from pyannote.audio import Model, Inference
+        device = device or pick_device()
+        token = token or os.environ.get("HF_TOKEN")
+        m = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", token=token)
+        m.to(torch.device(device))
+        _EMB = Inference(m, window="whole", device=torch.device(device))
+    return _EMB
+
+
+def embed_segment(emb_inf, seg_16k, sr=16000):
+    """Embed a 1-D float32 mono @16k segment -> 256-d vector (None if too short/empty)."""
+    seg = np.asarray(seg_16k, dtype=np.float32)
+    if len(seg) < int(0.25 * sr):
+        if len(seg) < int(0.05 * sr):
+            return None
+        seg = np.pad(seg, (0, int(0.25 * sr) - len(seg)))
+    out = emb_inf({"waveform": torch.from_numpy(seg).unsqueeze(0), "sample_rate": sr})
+    v = np.asarray(out).squeeze()
+    return v if v.ndim == 1 and not np.isnan(v).any() else None
+
+
 class SpeakerRegistry:
     """Persistent stable speaker IDs, matched across buffers by embedding cosine similarity.
 
