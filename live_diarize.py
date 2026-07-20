@@ -356,12 +356,17 @@ def overlay_mode(args):
     import soundfile as sf
     import overlay
     cwd = os.getcwd()
+    is_url = args.input.lower().startswith(("http://", "https://", "rtmp", "rtmps", "srt", "ytsearch"))
     if os.path.exists(args.input):
         video = args.input
-    else:
+    elif is_url:
         print("-> downloading video...", flush=True)
         video = download_video(args.input, os.path.join(cwd, "video.mp4"),
                                args.cookies_from_browser, args.js_runtime, args.remote_components)
+    else:
+        sys.exit(f"ERROR: file not found: {args.input}\n"
+                 f"  Pass the full path (it's not in this folder), e.g.\n"
+                 f'  python live_diarize.py "$env:USERPROFILE\\Downloads\\video.mp4" --overlay ...')
     wav = os.path.join(cwd, "_ov_audio.wav")
     subprocess.run([_tool("ffmpeg"), "-y", "-i", video, "-ac", "1", "-ar", str(SR), wav],
                    check=True, capture_output=True)
