@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Live Diarization — Review</title>
+<style>
+  :root{--bg:#0d0d1f;--panel:#161a2e;--muted:#8a8ab5;--line:#2a2f4a;--warn:#ffb020}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:#e8e8f0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:22px;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel);flex:0 0 auto;flex-wrap:wrap}
+  .now{display:flex;align-items:center;gap:10px;font-size:19px;font-weight:700;min-width:190px}
+  .dot{width:16px;height:16px;border-radius:50%;background:#555;flex:0 0 auto}
+  .stat{display:flex;flex-direction:column;line-height:1.15}
+  .stat b{font-size:21px}.stat span{font-size:11px;color:var(--muted)}
+  #status{margin-left:auto;font-size:12px;color:var(--muted)}
+  .warnwrap{color:var(--warn)}
+  main{flex:1 1 auto;display:flex;min-height:0}
+  .left{flex:1 1 62%;display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+  .videowrap{position:relative;background:#000;flex:0 0 auto}
+  video{width:100%;max-height:56vh;display:block;background:#000}
+  #overlaycap{position:absolute;left:0;right:0;bottom:14px;text-align:center;pointer-events:none}
+  #overlaycap span{display:inline-block;max-width:88%;background:rgba(0,0,0,.72);padding:6px 14px;border-radius:8px;font-size:20px;line-height:1.35}
+  #overlaycap .who{font-weight:700;font-size:13px;padding:1px 8px;border-radius:10px;margin-right:8px;vertical-align:2px}
+  .tlwrap{padding:10px 16px;flex:1 1 auto;overflow:auto}
+  .tlbar{position:relative;height:44px;width:100%;border-radius:8px;overflow:hidden;border:1px solid #333;background:#11152b;cursor:pointer}
+  .seg{position:absolute;top:0;height:100%}
+  #playhead{position:absolute;top:-3px;width:2px;height:50px;background:#fff;box-shadow:0 0 6px #fff;pointer-events:none}
+  .axis{display:flex;justify-content:space-between;color:#888;font:11px ui-monospace,monospace;margin-top:4px}
+  .legend{margin-top:12px;display:flex;flex-wrap:wrap;gap:6px}
+  .chip{padding:3px 11px;border-radius:14px;font:600 12px sans-serif;color:#fff}
+  .hint{color:var(--muted);font-size:12px;margin-top:10px;line-height:1.5}
+  .right{flex:1 1 38%;display:flex;flex-direction:column;min-width:280px}
+  .feedhead{padding:9px 16px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted);display:flex;gap:14px;align-items:center}
+  #onlyflags{cursor:pointer}
+  #feed{flex:1 1 auto;overflow:auto;padding:8px 14px 40px}
+  .cap{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);animation:fade .2s}
+  .cap.flagged{background:rgba(255,176,32,.08);border-left:3px solid var(--warn);padding-left:8px;margin-left:-8px}
+  @keyframes fade{from{opacity:0;transform:translateY(5px)}to{opacity:1}}
+  .tag{flex:0 0 auto;font-weight:700;font-size:12px;padding:2px 9px;border-radius:11px;color:#fff;height:fit-content;white-space:nowrap}
+  .txt{font-size:14px;line-height:1.45}
+  .flags{font-size:10px;color:var(--warn);font-family:ui-monospace,monospace;margin-top:2px}
+  .time{flex:0 0 auto;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px;padding-top:3px;cursor:pointer}
+  .lat{color:#667;font-size:10px}
+</style></head>
+<body>
+<header>
+  <div class="now"><span class="dot" id="curdot"></span><span id="curspk">waiting…</span></div>
+  <div class="stat"><b id="nspk">0</b><span>speakers</span></div>
+  <div class="stat"><b id="nchg">0</b><span>changes</span></div>
+  <div class="stat"><b id="ncap">0</b><span>captions</span></div>
+  <div class="stat warnwrap"><b id="nflag">0</b><span>flagged</span></div>
+  <div class="stat"><b id="clock">00:00</b><span>position</span></div>
+  <div id="status">connecting…</div>
+</header>
+<main>
+  <div class="left">
+    <div class="videowrap" id="videowrap">
+      <video id="vid" controls playsinline></video>
+      <div id="overlaycap"></div>
+    </div>
+    <div class="tlwrap">
+      <div class="tlbar" id="tlbar"><div id="playhead"></div></div>
+      <div class="axis" id="axis"></div>
+      <div class="legend" id="legend"></div>
+      <div class="hint" id="hint">Press play. Captions, the current-speaker dot and the timeline
+        stay locked to the video's clock. Click the timeline or a caption's timestamp to jump.
+        Flagged captions (⚠) are likely ASR hallucinations — silence/music loops, repeats.</div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="feedhead">
+      <span>caption feed</span>
+      <label id="onlyflags"><input type="checkbox" id="flagchk"> show only flagged</label>
+    </div>
+    <div id="feed"></div>
+  </div>
+</main>
+<script>
+const PALETTE=["#3498DB","#2ECC71","#E74C3C","#F39C12","#9B59B6","#1ABC9C","#E91E63","#FF9800","#34495E","#16A085"];
+const color=id=>PALETTE[((id||1)-1)%PALETTE.length];
+const fmt=t=>{t=Math.max(0,t|0);const h=t/3600|0,m=(t%3600)/60|0,s=t%60;return (h?String(h).padStart(2,"0")+":":"")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")};
+const $=id=>document.getElementById(id);
+
+let duration=0, hasVideo=false, realtime=true;
+let spkEvents=[];      // {media_t, speaker, changes, total_speakers}
+let capBuf=[];         // captions not yet revealed {media_t,end_t,speaker,text,flags}
+let shownCaps=0, flagged=0, seenSpk=new Set(), lastCap=null;
+const vid=$("vid");
+
+// ---------- clock: the video is the master; fall back to event time if no video ----------
+let fallbackT=0;
+function clock(){ return hasVideo ? (vid.currentTime||0) : fallbackT; }
+
+function speakerAt(t){
+  let cur=null;
+  for(const e of spkEvents){ if(e.media_t<=t) cur=e; else break; }
+  return cur;
+}
+
+function renderTimeline(){
+  const bar=$("tlbar");
+  [...bar.querySelectorAll(".seg")].forEach(n=>n.remove());
+  if(duration<=0) return;
+  for(let i=0;i<spkEvents.length;i++){
+    const s=spkEvents[i].media_t, e=(i+1<spkEvents.length)?spkEvents[i+1].media_t:Math.max(duration,clock());
+    const d=document.createElement("div");d.className="seg";
+    d.style.left=(s/duration*100)+"%";d.style.width=Math.max((e-s)/duration*100,0.05)+"%";
+    d.style.background=color(spkEvents[i].speaker);
+    d.title="SPEAKER "+spkEvents[i].speaker+"  "+fmt(s)+"–"+fmt(e);
+    bar.appendChild(d);
+  }
+}
+function renderLegend(){
+  const el=$("legend");el.innerHTML="";
+  [...seenSpk].sort((a,b)=>a-b).forEach(id=>{
+    const c=document.createElement("span");c.className="chip";c.style.background=color(id);
+    c.textContent="SPEAKER "+id;el.appendChild(c);
+  });
+}
+function renderAxis(){
+  if(duration<=0) return;
+  const el=$("axis");el.innerHTML="";
+  for(let i=0;i<=8;i++){const s=document.createElement("span");s.textContent=fmt(duration*i/8);el.appendChild(s);}
+}
+
+function addCaptionRow(m){
+  shownCaps++; $("ncap").textContent=shownCaps;
+  if(m.flags&&m.flags.length){flagged++; $("nflag").textContent=flagged;}
+  const feed=$("feed");
+  const flag=(m.flags&&m.flags.length);
+  const row=document.createElement("div");row.className="cap"+(flag?" flagged":"");
+  if($("flagchk").checked && !flag) row.style.display="none";
+  const time=document.createElement("div");time.className="time";time.textContent=fmt(m.media_t);
+  time.onclick=()=>{ if(hasVideo){vid.currentTime=m.media_t;} };
+  const tag=document.createElement("div");tag.className="tag";tag.textContent="SPK "+m.speaker;tag.style.background=color(m.speaker);
+  const body=document.createElement("div");
+  const txt=document.createElement("div");txt.className="txt";txt.textContent=(flag?"⚠ ":"")+m.text;
+  body.appendChild(txt);
+  if(flag){const fl=document.createElement("div");fl.className="flags";fl.textContent=m.flags.join(", ");body.appendChild(fl);}
+  row.append(time,tag,body);feed.appendChild(row);
+  const near=feed.scrollTop+feed.clientHeight>feed.scrollHeight-80;
+  if(near) feed.scrollTop=feed.scrollHeight;
+  // overlay subtitle
+  lastCap={text:m.text,speaker:m.speaker,end:m.end_t||(m.media_t+4)};
+}
+
+function tick(){
+  const t=clock();
+  $("clock").textContent=fmt(t);
+  // reveal captions whose start has passed
+  capBuf.sort((a,b)=>a.media_t-b.media_t);
+  while(capBuf.length && capBuf[0].media_t<=t+0.05){ addCaptionRow(capBuf.shift()); }
+  // current speaker
+  const cs=speakerAt(t);
+  if(cs){
+    $("curspk").textContent="SPEAKER "+cs.speaker;
+    $("curdot").style.background=color(cs.speaker);
+    $("nspk").textContent=cs.total_speakers;
+    $("nchg").textContent=cs.changes;
+  }
+  // playhead + overlay
+  if(duration>0) $("playhead").style.left=(Math.min(t,duration)/duration*100)+"%";
+  const ov=$("overlaycap");
+  if(lastCap && t<=lastCap.end+1.0){
+    ov.innerHTML="";const sp=document.createElement("span");
+    const who=document.createElement("span");who.className="who";who.textContent="SPK "+lastCap.speaker;who.style.background=color(lastCap.speaker);
+    sp.appendChild(who);sp.appendChild(document.createTextNode(lastCap.text));ov.appendChild(sp);
+  } else ov.innerHTML="";
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+$("tlbar").onclick=e=>{
+  if(!hasVideo||duration<=0)return;
+  const r=e.currentTarget.getBoundingClientRect();
+  vid.currentTime=(e.clientX-r.left)/r.width*duration;
+};
+$("flagchk").onchange=()=>{
+  [...document.querySelectorAll(".cap")].forEach(r=>{
+    r.style.display=($("flagchk").checked && !r.classList.contains("flagged"))?"none":"flex";
+  });
+};
+
+function connect(){
+  const ws=new WebSocket("ws://localhost:8765");
+  ws.onopen =()=>$("status").textContent="● live";
+  ws.onclose=()=>{$("status").textContent="disconnected — retrying…";setTimeout(connect,1500)};
+  ws.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.type==="init"){
+      duration=m.duration||0; realtime=m.realtime;
+      if(m.video){hasVideo=true; vid.src=m.video;} else {hasVideo=false; $("videowrap").style.display="none";}
+      renderAxis();
+      $("status").textContent=`● ${m.device?.toUpperCase()||""} · ${m.asr} · ${m.language}`;
+      return;
+    }
+    if(m.type==="status"){$("status").textContent=m.msg;return;}
+    if(m.type==="speaker"){
+      seenSpk.add(m.speaker); spkEvents.push(m); spkEvents.sort((a,b)=>a.media_t-b.media_t);
+      if(!hasVideo) fallbackT=Math.max(fallbackT,m.media_t);
+      renderTimeline(); renderLegend();
+      return;
+    }
+    if(m.type==="caption"){
+      if(!hasVideo){ fallbackT=Math.max(fallbackT,m.end_t||m.media_t); }
+      capBuf.push(m);
+      return;
+    }
+    if(m.type==="done"){
+      $("status").textContent=`✓ done — ${m.speakers} speakers, ${m.changes} changes, ${m.captions} captions, ${m.flagged} flagged`;
+      return;
+    }
+  };
+}
+connect();
+</script>
+</body></html>

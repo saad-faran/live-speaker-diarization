@@ -22,6 +22,14 @@ models/
 *.ckpt
 *.bin
 
+# generated review/run outputs
+captions.srt
+review_log.jsonl
+live_result.json
+live_timeline.html
+live_labeled.mp4
+video.mp4
+
 # os
 .DS_Store
 Thumbs.db
