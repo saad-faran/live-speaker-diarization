@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Live Speaker Diarization — Captions</title>
+<style>
+  :root{--bg:#0d0d1f;--panel:#161a2e;--muted:#8a8ab5;--line:#2a2f4a}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:#e8e8f0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+  header{display:flex;align-items:center;gap:18px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0}
+  .now{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700}
+  .dot{width:16px;height:16px;border-radius:50%;background:#555}
+  .stat{display:flex;flex-direction:column;line-height:1.1}
+  .stat b{font-size:22px}.stat span{font-size:11px;color:var(--muted)}
+  #status{margin-left:auto;font-size:12px;color:var(--muted)}
+  #feed{max-width:900px;margin:0 auto;padding:18px 20px 80px}
+  .cap{display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);animation:fade .25s}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+  .tag{flex:0 0 auto;font-weight:700;font-size:13px;padding:2px 10px;border-radius:12px;color:#fff;height:fit-content;white-space:nowrap}
+  .txt{font-size:15px;line-height:1.5}
+  .time{flex:0 0 auto;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px;padding-top:3px}
+</style></head>
+<body>
+<header>
+  <div class="now"><span class="dot" id="curdot"></span><span id="curspk">waiting…</span></div>
+  <div class="stat"><b id="nspk">0</b><span>speakers</span></div>
+  <div class="stat"><b id="nchg">0</b><span>changes</span></div>
+  <div class="stat"><b id="clock">00:00</b><span>stream time</span></div>
+  <div id="status">connecting…</div>
+</header>
+<div id="feed"></div>
+<script>
+const PALETTE=["#3498DB","#2ECC71","#E74C3C","#F39C12","#9B59B6","#1ABC9C","#E91E63","#FF9800","#34495E","#16A085"];
+const color=id=>PALETTE[(id-1)%PALETTE.length];
+const fmt=t=>{t=Math.max(0,t|0);return String(t/60|0).padStart(2,"0")+":"+String(t%60).padStart(2,"0")};
+const $=id=>document.getElementById(id);
+let lastCap=null;
+
+function connect(){
+  const ws=new WebSocket("ws://localhost:8765");
+  ws.onopen =()=>$("status").textContent="● live";
+  ws.onclose=()=>{$("status").textContent="disconnected — retrying…";setTimeout(connect,1500)};
+  ws.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==="status"){$("status").textContent=m.msg;return;}
+    if(m.type==="speaker"){
+      $("curspk").textContent="SPEAKER "+m.speaker;
+      $("curdot").style.background=color(m.speaker);
+      $("nspk").textContent=m.total_speakers;
+      $("nchg").textContent=m.changes;
+      $("clock").textContent=fmt(m.t);
+      return;
+    }
+    if(m.type==="caption"){
+      $("clock").textContent=fmt(m.t);
+      const feed=$("feed");
+      // append to the previous caption bubble if same speaker & recent
+      if(lastCap&&lastCap.spk===m.speaker){
+        lastCap.txt.textContent+=" "+m.text;
+      }else{
+        const row=document.createElement("div");row.className="cap";
+        const time=document.createElement("div");time.className="time";time.textContent=fmt(m.t);
+        const tag=document.createElement("div");tag.className="tag";tag.textContent="SPEAKER "+m.speaker;tag.style.background=color(m.speaker);
+        const txt=document.createElement("div");txt.className="txt";txt.textContent=m.text;
+        row.append(time,tag,txt);feed.appendChild(row);
+        lastCap={spk:m.speaker,txt};
+      }
+      window.scrollTo(0,document.body.scrollHeight);
+    }
+  };
+}
+connect();
+</script>
+</body></html>

@@ -18,3 +18,7 @@ Pillow>=9.0
 # Optional — background-music removal before diarizing (--separate-vocals).
 # Heavy; needs a GPU to be practical. Install only if you need it:
 #   pip install demucs
+
+# Live captions UI (live_captions.py): WebSocket server + streaming ASR
+websockets>=12
+faster-whisper>=1.0
