@@ -65,8 +65,14 @@ class SpeakerRegistry:
     otherwise it becomes a new speaker. Centroids update with an EMA so a voice's natural
     variation is absorbed instead of spawning phantom speakers.
     """
-    def __init__(self, match_sim=REGISTRY_MATCH_SIM, ema=0.2):
-        self.match_sim, self.ema = match_sim, ema
+    def __init__(self, match_sim=REGISTRY_MATCH_SIM, ema=0.2, ema_gate=0.45):
+        # ema_gate: only pull a speaker's centroid toward a new match when the match
+        # is CONFIDENT (cosine >= ema_gate). Borderline matches (match_sim..ema_gate)
+        # still get the stable ID, but must NOT drag the fingerprint — otherwise a
+        # well-established voice slowly drifts, then fails to match itself later
+        # (spawns a phantom new ID) or gets stolen by a different speaker. Clean,
+        # high-similarity matches (~0.83) are unaffected.
+        self.match_sim, self.ema, self.ema_gate = match_sim, ema, ema_gate
         self.centroids, self.counts, self._next = {}, {}, 1
 
     def match(self, local_embs):
@@ -80,7 +86,8 @@ class SpeakerRegistry:
             if ll in used_ll or sid in used_sid or sim < self.match_sim:
                 continue
             emb = dict(cand)[ll]
-            self.centroids[sid] = (1 - self.ema) * self.centroids[sid] + self.ema * emb
+            if sim >= self.ema_gate:                # only confident matches move the fingerprint
+                self.centroids[sid] = (1 - self.ema) * self.centroids[sid] + self.ema * emb
             self.counts[sid] += 1
             assigned[ll] = sid
             used_sid.add(sid)

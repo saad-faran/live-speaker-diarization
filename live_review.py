@@ -231,8 +231,10 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
     t0 = time.time()
     step = int(0.5 * SR)                      # 0.5s ingest granularity
     fed = 0
-    asr_buf = np.zeros(0, dtype=np.float32)
-    asr_base = 0.0
+    asr_audio = np.zeros(0, dtype=np.float32)  # rolling ASR buffer (kept with left-overlap)
+    asr_start = 0.0                            # media time of asr_audio[0]
+    emitted_until = 0.0                        # media time transcribed & emitted so far
+    overlap = args.asr_overlap
     next_diar = ld.stride
     next_asr = args.asr_interval
     cur = None
@@ -249,7 +251,7 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
         ld.feed(pkt)
         fed += len(pkt)
         media_t = fed / SR
-        asr_buf = np.concatenate([asr_buf, pkt])
+        asr_audio = np.concatenate([asr_audio, pkt])
         if not args.fast:
             # pace ingestion to 1x real-time so the dashboard's video stays in step
             target = t0 + media_t
@@ -279,40 +281,67 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
                         emit(rec)
                         log_f.write(json.dumps(rec) + "\n"); log_f.flush()
 
-        # ---- ASR transcription ----
-        if media_t >= next_asr and len(asr_buf) >= args.asr_interval * SR:
+        # ---- ASR transcription (OVERLAPPING windows, boundary-safe) ----
+        # Transcribe from a little BEFORE the last emitted point so whisper gets
+        # left-context and words straddling a chunk edge are never clipped; emit
+        # only the newly-settled segments (a_end past emitted_until) to avoid dups.
+        if media_t >= next_asr:
             next_asr = media_t + args.asr_interval
-            seg_audio, base = asr_buf, asr_base
-            asr_base += len(asr_buf) / SR
-            asr_buf = np.zeros(0, dtype=np.float32)
-            try:
-                segs, _ = asr.transcribe(seg_audio, vad_filter=True, language=args.language)
-                blocks = ld.finalize()
-                for sg in segs:
-                    txt = sg.text.strip()
-                    if not txt:
-                        continue
-                    a_start, a_end = base + sg.start, base + sg.end
-                    mid = (a_start + a_end) / 2.0
-                    spk = _speaker_at(blocks, mid)
-                    dur = max(a_end - a_start, 0.1)
-                    flags = _hallucination_flags(txt, dur, spk, recent_texts)
-                    recent_texts.append(txt); recent_texts[:] = recent_texts[-5:]
-                    disp_spk = spk if spk is not None else (cur or 1)
-                    n_caps += 1
-                    if flags:
-                        n_flagged += 1
-                    wall = time.time() - t0
-                    cap = {"type": "caption", "speaker": disp_spk, "text": txt,
-                           "media_t": round(a_start, 2), "end_t": round(a_end, 2),
-                           "wall_t": round(wall, 2),
-                           "latency": None if args.fast else round(wall - a_end, 2),
-                           "flags": flags}
-                    emit(cap)
-                    srt.add(a_start, a_end, disp_spk, txt)
-                    log_f.write(json.dumps(cap) + "\n"); log_f.flush()
-            except Exception as e:
-                emit({"type": "status", "msg": f"asr error: {e}"})
+            seg_from = max(emitted_until - overlap, asr_start)
+            i0 = int(round((seg_from - asr_start) * SR))
+            chunk = asr_audio[max(i0, 0):]
+            if len(chunk) >= SR:                      # need >= 1s to transcribe
+                try:
+                    segs, _ = asr.transcribe(
+                        chunk, language=args.language, beam_size=5,
+                        vad_filter=True, vad_parameters=dict(min_silence_duration_ms=400),
+                        condition_on_previous_text=False, word_timestamps=True)
+                    blocks = ld.finalize()
+                    for sg in segs:
+                        # keep only words we haven't emitted yet (drops the overlap
+                        # region cleanly -> no repeated words, no clipped words)
+                        words = [w for w in (sg.words or [])
+                                 if seg_from + w.end > emitted_until + 0.05]
+                        if sg.words:
+                            if not words:
+                                continue
+                            txt = "".join(w.word for w in words).strip()
+                            a_start = seg_from + words[0].start
+                            a_end = seg_from + words[-1].end
+                        else:                                 # no word timestamps -> segment-level
+                            txt = sg.text.strip()
+                            a_start, a_end = seg_from + sg.start, seg_from + sg.end
+                            if a_end <= emitted_until + 0.05:
+                                continue
+                        if not txt:
+                            continue
+                        emitted_until = max(emitted_until, a_end)
+                        mid = (a_start + a_end) / 2.0
+                        spk = _speaker_at(blocks, mid)
+                        dur = max(a_end - a_start, 0.1)
+                        flags = _hallucination_flags(txt, dur, spk, recent_texts)
+                        recent_texts.append(txt); recent_texts[:] = recent_texts[-5:]
+                        disp_spk = spk if spk is not None else (cur or 1)
+                        n_caps += 1
+                        if flags:
+                            n_flagged += 1
+                        wall = time.time() - t0
+                        cap = {"type": "caption", "speaker": disp_spk, "text": txt,
+                               "media_t": round(a_start, 2), "end_t": round(a_end, 2),
+                               "wall_t": round(wall, 2),
+                               "latency": None if args.fast else round(wall - a_end, 2),
+                               "flags": flags}
+                        emit(cap)
+                        srt.add(a_start, a_end, disp_spk, txt)
+                        log_f.write(json.dumps(cap) + "\n"); log_f.flush()
+                except Exception as e:
+                    emit({"type": "status", "msg": f"asr error: {e}"})
+                # drop everything we no longer need, keeping a left-overlap tail
+                keep_from = max(emitted_until - overlap - 1.0, asr_start)
+                drop = int(round((keep_from - asr_start) * SR))
+                if drop > 0:
+                    asr_audio = asr_audio[drop:]
+                    asr_start = keep_from
 
     emit({"type": "done", "captions": n_caps, "flagged": n_flagged, "changes": changes,
           "speakers": len(seen)})
@@ -438,6 +467,8 @@ def main():
                     help="process as fast as possible (default replays at 1x real-time)")
     ap.add_argument("--asr-model", default="small", help="faster-whisper: tiny|base|small|medium")
     ap.add_argument("--asr-interval", type=float, default=6.0, help="transcribe every N seconds")
+    ap.add_argument("--asr-overlap", type=float, default=2.0,
+                    help="seconds of left-overlap per ASR window (avoids clipping words at chunk edges)")
     ap.add_argument("--language", default=None, help="force ASR language (e.g. ur, en); default auto-detect")
     ap.add_argument("--window", type=float, default=15.0)
     ap.add_argument("--stride", type=float, default=1.5)
