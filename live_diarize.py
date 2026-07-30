@@ -79,13 +79,18 @@ def is_direct_stream(url):
         or u.startswith(("rtmp://", "rtmps://", "srt://", "udp://", "rtp://"))
 
 
-def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_components=None):
+def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_components=None,
+                   cookies=None):
     """Resolve a URL to a direct media URL ffmpeg can read.
-    Direct stream URLs (HLS/RTMP/SRT/…) bypass yt-dlp entirely."""
+    Direct stream URLs (HLS/RTMP/SRT/…) bypass yt-dlp entirely.
+    `cookies` = path to an exported cookies.txt (use when --cookies-from-browser
+    fails, e.g. Chrome's locked/app-bound-encrypted cookie DB on Windows)."""
     if is_direct_stream(url):
         return url
     ytdlp = _tool("yt-dlp")
     base = [ytdlp, "--no-warnings"]
+    if cookies:
+        base += ["--cookies", cookies]
     if cookies_from_browser:
         base += ["--cookies-from-browser", cookies_from_browser]
     if js_runtime:
@@ -119,10 +124,12 @@ def to_16k_mono_wav(path):
     return out
 
 
-def download_video(url, out, cookies=None, js=None, remote=None):
+def download_video(url, out, cookies=None, js=None, remote=None, cookies_file=None):
     """Download a YouTube (or other) video with audio, as an mp4."""
     ytdlp = _tool("yt-dlp")
     cmd = [ytdlp, "--no-warnings", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out]
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
     if cookies:
         cmd += ["--cookies-from-browser", cookies]
     if js:
@@ -362,7 +369,8 @@ def overlay_mode(args):
     elif is_url:
         print("-> downloading video...", flush=True)
         video = download_video(args.input, os.path.join(cwd, "video.mp4"),
-                               args.cookies_from_browser, args.js_runtime, args.remote_components)
+                               args.cookies_from_browser, args.js_runtime, args.remote_components,
+                               cookies_file=args.cookies)
     else:
         sys.exit(f"ERROR: file not found: {args.input}\n"
                  f"  Pass the full path (it's not in this folder), e.g.\n"
@@ -427,6 +435,9 @@ def main():
                     help="strip background music with Demucs before diarizing (music-heavy audio)")
     ap.add_argument("--cookies-from-browser", default=None,
                     help="chrome|edge|firefox — auth to bypass YouTube's bot check")
+    ap.add_argument("--cookies", default=None,
+                    help="path to an exported cookies.txt (use when --cookies-from-browser "
+                         "fails, e.g. Chrome's locked cookie DB on Windows)")
     ap.add_argument("--js-runtime", default=None, help="JS runtime for yt-dlp (node|deno)")
     ap.add_argument("--remote-components", default=None,
                     help="e.g. ejs:npm — let yt-dlp fetch YouTube's JS challenge solver")
@@ -469,7 +480,8 @@ def main():
         src = resolve_stream(args.input,
                              cookies_from_browser=args.cookies_from_browser,
                              js_runtime=args.js_runtime,
-                             remote_components=args.remote_components)
+                             remote_components=args.remote_components,
+                             cookies=args.cookies)
         proc = subprocess.Popen([_tool("ffmpeg"), "-loglevel", "quiet", "-i", src,
                                  "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
                                 stdout=subprocess.PIPE, bufsize=10 ** 7)

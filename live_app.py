@@ -232,7 +232,8 @@ class Manager:
         try:
             self.log({"type": "status", "msg": "resolving stream…"})
             src = resolve_stream(url, cookies_from_browser=a.cookies_from_browser,
-                                 js_runtime=a.js_runtime, remote_components=a.remote_components)
+                                 js_runtime=a.js_runtime, remote_components=a.remote_components,
+                                 cookies=a.cookies)
         except Exception as e:
             self.log({"type": "status", "msg": f"could not open URL: {e}"})
             return
@@ -417,6 +418,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--match-sim", type=float, default=0.30)
     ap.add_argument("--cookies-from-browser", default=None)
+    ap.add_argument("--cookies", default=None,
+                    help="path to an exported cookies.txt (use when --cookies-from-browser "
+                         "fails, e.g. Chrome's locked cookie DB on Windows)")
     ap.add_argument("--js-runtime", default=None)
     ap.add_argument("--remote-components", default=None)
     args = ap.parse_args()
