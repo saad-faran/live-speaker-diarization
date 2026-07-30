@@ -154,9 +154,9 @@ class Manager:
         ld.pipe = self.pipe
         ld.reg = SpeakerRegistry(match_sim=a.match_sim)
         ld.win_n = int(15.0 * SR)
-        ld.stride = 1.5
-        ld.warmup_n = int(4.0 * SR)
-        ld.commit_lag = 1.0
+        ld.stride = a.stride
+        ld.warmup_n = int(3.0 * SR)
+        ld.commit_lag = a.commit_lag
         ld.min_change_dur = 0.4
         ld.merge_gap = 0.4
         ld.buf = np.zeros(0, dtype=np.float32)
@@ -412,8 +412,13 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="Paste-a-URL live diarization console.")
     ap.add_argument("--asr-model", default="small", help="faster-whisper: tiny|base|small|medium")
-    ap.add_argument("--asr-interval", type=float, default=6.0)
+    ap.add_argument("--asr-interval", type=float, default=2.5,
+                    help="transcribe every N s — LOWER = lower caption latency (needs a fast GPU)")
     ap.add_argument("--asr-overlap", type=float, default=2.0)
+    ap.add_argument("--stride", type=float, default=1.0,
+                    help="diarization commit cadence (s) — lower = faster speaker switches")
+    ap.add_argument("--commit-lag", type=float, default=0.75,
+                    help="hold back the newest N s before committing (lower = faster, less context)")
     ap.add_argument("--language", default=None, help="force ASR language (e.g. en, ur); default auto")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--match-sim", type=float, default=0.30)
