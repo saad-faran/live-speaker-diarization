@@ -25,6 +25,23 @@ def _cos(a, b):
     return float(a @ b)
 
 
+def ensure_av():
+    """faster-whisper imports PyAV (`av`) at load time for its file-decoder. On
+    locked-down Windows the av native DLL can be blocked by Application Control /
+    Smart App Control ("An Application Control policy has blocked this file"). We
+    decode audio ourselves with ffmpeg and feed faster-whisper NumPy arrays, so av
+    is never actually used — stub it out if it can't load, so the import succeeds."""
+    import sys, types
+    if "av" in sys.modules:
+        return
+    try:
+        import av  # noqa: F401
+    except Exception as e:
+        sys.modules["av"] = types.ModuleType("av")
+        print(f"-> note: PyAV unavailable ({type(e).__name__}); stubbing it "
+              f"(audio is decoded via ffmpeg, so this is harmless).", flush=True)
+
+
 def pick_device():
     """CUDA (NVIDIA) > MPS (Apple Silicon) > CPU."""
     if torch.cuda.is_available():

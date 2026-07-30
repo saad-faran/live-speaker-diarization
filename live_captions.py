@@ -82,6 +82,8 @@ def pipeline(args):
                             stdout=subprocess.PIPE, bufsize=10 ** 7)
     device = pick_device()
     ld = LiveDiarizer(threshold=args.threshold)          # ONLINE registry (true-live)
+    from core import ensure_av
+    ensure_av()
     from faster_whisper import WhisperModel
     asr = WhisperModel(args.asr_model,
                        device="cuda" if device == "cuda" else "cpu",

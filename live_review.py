@@ -219,6 +219,8 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
     ld = LiveDiarizer(window=args.window, stride=args.stride, commit_lag=args.commit_lag,
                       threshold=args.threshold, min_change_dur=args.min_change_dur,
                       match_sim=args.match_sim)
+    from core import ensure_av
+    ensure_av()
     from faster_whisper import WhisperModel
     asr = WhisperModel(args.asr_model, device="cuda" if device == "cuda" else "cpu",
                        compute_type="float16" if device == "cuda" else "int8")

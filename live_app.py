@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 import websockets
-from core import pick_device, load_pipeline, SpeakerRegistry
+from core import pick_device, load_pipeline, SpeakerRegistry, ensure_av
 from live_diarize import resolve_stream, _tool, SR, LiveDiarizer
 
 WS_PORT = 8766
@@ -130,6 +130,7 @@ class Manager:
         print(f"-> loading models on {self.device.upper()} (one time)...", flush=True)
         # load the heavy models ONCE; reuse across URL swaps
         self.pipe = load_pipeline(device=self.device, clustering_threshold=args.threshold)
+        ensure_av()
         from faster_whisper import WhisperModel
         self.asr = WhisperModel(args.asr_model,
                                 device="cuda" if self.device == "cuda" else "cpu",
