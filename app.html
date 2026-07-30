@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Live Diarization Console</title>
+<style>
+  :root{--bg:#0b0d1a;--panel:#141829;--muted:#8a8ab5;--line:#262b45;--warn:#ffb020;--good:#2ECC71}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:#e8e8f0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;display:flex;flex-direction:column}
+  header{display:flex;gap:10px;align-items:center;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  input#url{flex:1 1 340px;min-width:220px;background:#0c0f1e;border:1px solid var(--line);color:#e8e8f0;padding:9px 12px;border-radius:8px;font-size:14px}
+  input#note{flex:0 1 190px;background:#0c0f1e;border:1px solid var(--line);color:#e8e8f0;padding:9px 10px;border-radius:8px;font-size:13px}
+  button{border:0;border-radius:8px;padding:9px 14px;font-weight:700;font-size:13px;cursor:pointer;color:#fff}
+  #start{background:#2e7d32}#stop{background:#5a2b2b}#mark{background:#8a6d1a}
+  .ghost{background:#22273f}
+  #status{margin-left:auto;font-size:12px;color:var(--muted)}
+  .clock{font-family:ui-monospace,monospace;font-size:13px;color:var(--muted)}
+  main{flex:1 1 auto;display:flex;min-height:0}
+  .left{flex:1 1 64%;display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+  .vidwrap{background:#000;flex:0 0 auto}
+  .vidwrap iframe{width:100%;height:34vh;border:0;display:block}
+  .nowcap{padding:14px 18px;border-bottom:1px solid var(--line);min-height:70px;display:flex;align-items:center;gap:12px}
+  .nowcap .who{font-weight:800;font-size:13px;padding:3px 12px;border-radius:12px;color:#fff;white-space:nowrap}
+  .nowcap .txt{font-size:22px;line-height:1.35}
+  #feed{flex:1 1 auto;overflow:auto;padding:10px 18px 60px}
+  .cap{display:flex;gap:11px;padding:7px 0;border-bottom:1px solid var(--line);animation:fade .2s}
+  .cap.flagged{background:rgba(255,176,32,.08);border-left:3px solid var(--warn);padding-left:8px;margin-left:-8px}
+  .cap.mark{background:rgba(46,204,113,.10);border-left:3px solid var(--good);padding-left:8px;margin-left:-8px;font-style:italic;color:#bfe}
+  @keyframes fade{from{opacity:0;transform:translateY(5px)}to{opacity:1}}
+  .tag{flex:0 0 auto;font-weight:700;font-size:12px;padding:2px 9px;border-radius:11px;color:#fff;height:fit-content;white-space:nowrap}
+  .txt{font-size:15px;line-height:1.45}
+  .flags{font-size:10px;color:var(--warn);font-family:ui-monospace,monospace}
+  .time{flex:0 0 auto;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px;padding-top:3px}
+  .side{flex:1 1 36%;min-width:270px;display:flex;flex-direction:column}
+  .sidehead{padding:11px 16px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center}
+  .kpi{display:flex;flex-direction:column;line-height:1.1}.kpi b{font-size:22px}.kpi span{font-size:10px;color:var(--muted)}
+  #roster{flex:1 1 auto;overflow:auto;padding:8px 12px 40px}
+  .spk{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;margin-bottom:6px;background:#11152a;border:1px solid var(--line)}
+  .spk.cur{outline:2px solid #fff}
+  .dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto}
+  .spk .name{font-weight:700;font-size:14px}
+  .spk .meta{margin-left:auto;text-align:right;font-family:ui-monospace,monospace;font-size:11px;color:var(--muted)}
+  .newbadge{font-size:9px;background:var(--good);color:#04220f;padding:1px 6px;border-radius:8px;font-weight:800;margin-left:6px}
+  .hint{color:var(--muted);font-size:11px;padding:8px 16px;line-height:1.5}
+  a.dl{color:#7db8ff;font-size:12px;text-decoration:none;margin-left:6px}
+</style></head>
+<body>
+<header>
+  <input id="url" placeholder="Paste a YouTube URL (live or recorded) or a direct HLS/RTMP URL">
+  <button id="start">▶ Start</button>
+  <button id="stop" class="ghost">■ Stop</button>
+  <input id="note" placeholder="note (optional)">
+  <button id="mark">⚑ Mark issue</button>
+  <span class="clock" id="clock">00:00</span>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <div class="left">
+    <div class="vidwrap" id="vidwrap" style="display:none"><iframe id="yt" allow="autoplay"></iframe></div>
+    <div class="nowcap" id="nowcap"><span class="txt" style="color:#667">waiting for a stream…</span></div>
+    <div id="feed"></div>
+  </div>
+  <div class="side">
+    <div class="sidehead">
+      <div class="kpi"><b id="nspk">0</b><span>unique speakers</span></div>
+      <div class="kpi"><b id="nchg">0</b><span>turns / changes</span></div>
+      <div style="margin-left:auto;text-align:right">
+        <a class="dl" id="dllog" href="/session.jsonl" download>⤓ log</a>
+        <a class="dl" id="dlsrt" href="/session.srt" download>⤓ srt</a>
+      </div>
+    </div>
+    <div class="hint">Each speaker below is a persistent ID (color-matched to the captions). "turns" counts
+      every time they (re)appear; "talk" is their total speaking time. See a wrong label? type a note and
+      hit <b>Mark issue</b> — it timestamps the log so it's easy to send back for fixing.</div>
+    <div id="roster"></div>
+  </div>
+</main>
+<script>
+const PALETTE=["#3498DB","#2ECC71","#E74C3C","#F39C12","#9B59B6","#1ABC9C","#E91E63","#FF9800","#34495E","#16A085"];
+const color=id=>PALETTE[((id||1)-1)%PALETTE.length];
+const fmt=t=>{t=Math.max(0,t|0);const h=t/3600|0,m=(t%3600)/60|0,s=t%60;return (h?String(h).padStart(2,"0")+":":"")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")};
+const $=id=>document.getElementById(id);
+let ws=null, lastSpk=null;
+
+function ytId(u){
+  const m=u.match(/(?:v=|youtu\.be\/|\/live\/|\/embed\/)([A-Za-z0-9_-]{11})/);
+  return m?m[1]:null;
+}
+function showVideo(u){
+  const id=ytId(u);
+  if(id){ $("yt").src=`https://www.youtube.com/embed/${id}?autoplay=1&mute=1`; $("vidwrap").style.display="block"; }
+  else { $("vidwrap").style.display="none"; $("yt").src=""; }
+}
+
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+
+function addCap(m){
+  const feed=$("feed"), flag=(m.flags&&m.flags.length);
+  const row=document.createElement("div"); row.className="cap"+(flag?" flagged":"");
+  const time=document.createElement("div"); time.className="time"; time.textContent=fmt(m.t);
+  const tag=document.createElement("div"); tag.className="tag"; tag.textContent="SPK "+m.speaker; tag.style.background=color(m.speaker);
+  const body=document.createElement("div");
+  const txt=document.createElement("div"); txt.className="txt"; txt.textContent=(flag?"⚠ ":"")+m.text; body.appendChild(txt);
+  if(flag){const f=document.createElement("div");f.className="flags";f.textContent=m.flags.join(", ");body.appendChild(f);}
+  row.append(time,tag,body); feed.appendChild(row);
+  const near=feed.scrollTop+feed.clientHeight>feed.scrollHeight-100;
+  if(near) feed.scrollTop=feed.scrollHeight;
+  // big "now" caption
+  $("nowcap").innerHTML="";
+  const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+m.speaker; who.style.background=color(m.speaker);
+  const t2=document.createElement("span"); t2.className="txt"; t2.textContent=m.text;
+  $("nowcap").append(who,t2);
+}
+function addMark(m){
+  const feed=$("feed"); const row=document.createElement("div"); row.className="cap mark";
+  const time=document.createElement("div"); time.className="time"; time.textContent=fmt(m.t);
+  const body=document.createElement("div"); body.className="txt"; body.textContent="⚑ MARKED"+(m.note?": "+m.note:"");
+  row.append(time,body); feed.appendChild(row); feed.scrollTop=feed.scrollHeight;
+}
+function renderRoster(m){
+  $("nspk").textContent=m.total_speakers; $("nchg").textContent=m.changes; $("clock").textContent=fmt(m.t);
+  const el=$("roster"); el.innerHTML="";
+  for(const s of m.roster){
+    const row=document.createElement("div"); row.className="spk"+(s.speaker===m.current?" cur":"");
+    const dot=document.createElement("div"); dot.className="dot"; dot.style.background=color(s.speaker);
+    const name=document.createElement("div"); name.className="name"; name.textContent="SPEAKER "+s.speaker;
+    const meta=document.createElement("div"); meta.className="meta";
+    meta.innerHTML=`${s.turns} turn${s.turns===1?"":"s"} · ${fmt(s.talk)}<br>last ${fmt(s.last_t)}`;
+    row.append(dot,name,meta); el.appendChild(row);
+  }
+}
+
+$("start").onclick=()=>{ const u=$("url").value.trim(); if(!u)return; $("feed").innerHTML=""; showVideo(u); send({cmd:"start",url:u}); };
+$("stop").onclick =()=> send({cmd:"stop"});
+$("mark").onclick =()=>{ send({cmd:"mark",note:$("note").value.trim()}); $("note").value=""; };
+$("url").addEventListener("keydown",e=>{ if(e.key==="Enter") $("start").click(); });
+
+function connect(){
+  ws=new WebSocket("ws://localhost:8766");
+  ws.onopen =()=>$("status").textContent="● ready";
+  ws.onclose=()=>{$("status").textContent="disconnected — retrying…";setTimeout(connect,1500)};
+  ws.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.type==="status"){$("status").textContent=m.msg;}
+    else if(m.type==="session"){$("status").textContent="● "+m.url;}
+    else if(m.type==="caption"){addCap(m);}
+    else if(m.type==="marked"){addMark(m);}
+    else if(m.type==="stats"){renderRoster(m);}
+    else if(m.type==="speaker"){ $("clock").textContent=fmt(m.t); }
+  };
+}
+connect();
+</script>
+</body></html>

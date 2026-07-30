@@ -35,3 +35,8 @@ video.mp4
 Thumbs.db
 review_report.md
 review_index.md
+session.jsonl
+session.srt
+_*_session.jsonl
+_*_session.srt
+app.html.bak
