@@ -16,8 +16,12 @@
   .clock{font-family:ui-monospace,monospace;font-size:13px;color:var(--muted)}
   main{flex:1 1 auto;display:flex;min-height:0}
   .left{flex:1 1 64%;display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
-  .vidwrap{background:#000;flex:0 0 auto}
-  .vidwrap iframe{width:100%;height:34vh;border:0;display:block}
+  .vidwrap{background:#000;flex:0 0 auto;position:relative}
+  .vidwrap iframe{width:100%;height:42vh;border:0;display:block}
+  .vcap{position:absolute;left:0;right:0;bottom:12px;text-align:center;pointer-events:none}
+  .vcap span{display:inline-block;max-width:90%;background:rgba(0,0,0,.74);padding:6px 15px;border-radius:8px;font-size:20px;line-height:1.35}
+  .vcap .who{font-weight:800;font-size:13px;padding:1px 9px;border-radius:10px;margin-right:8px;vertical-align:2px;color:#fff}
+  .vcap .off{position:absolute;top:6px;right:10px;font-size:10px;color:#aab;background:rgba(0,0,0,.6);padding:1px 7px;border-radius:8px}
   .nowcap{padding:14px 18px;border-bottom:1px solid var(--line);min-height:70px;display:flex;align-items:center;gap:12px}
   .nowcap .who{font-weight:800;font-size:13px;padding:3px 12px;border-radius:12px;color:#fff;white-space:nowrap}
   .nowcap .txt{font-size:22px;line-height:1.35}
@@ -55,7 +59,11 @@
 </header>
 <main>
   <div class="left">
-    <div class="vidwrap" id="vidwrap" style="display:none"><iframe id="yt" allow="autoplay"></iframe></div>
+    <div class="vidwrap" id="vidwrap" style="display:none">
+      <iframe id="yt" allow="autoplay"></iframe>
+      <div class="vcap" id="vidcap"></div>
+      <div class="off">captions ≈2–4s behind the video (live diarization latency)</div>
+    </div>
     <div class="nowcap" id="nowcap"><span class="txt" style="color:#667">waiting for a stream…</span></div>
     <div id="feed"></div>
   </div>
@@ -87,8 +95,8 @@ function ytId(u){
 }
 function showVideo(u){
   const id=ytId(u);
-  if(id){ $("yt").src=`https://www.youtube.com/embed/${id}?autoplay=1&mute=1`; $("vidwrap").style.display="block"; }
-  else { $("vidwrap").style.display="none"; $("yt").src=""; }
+  if(id){ $("yt").src=`https://www.youtube.com/embed/${id}?autoplay=1&mute=1`; $("vidwrap").style.display="block"; $("nowcap").style.display="none"; }
+  else { $("vidwrap").style.display="none"; $("yt").src=""; $("nowcap").style.display="flex"; }
 }
 
 function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
@@ -104,11 +112,19 @@ function addCap(m){
   row.append(time,tag,body); feed.appendChild(row);
   const near=feed.scrollTop+feed.clientHeight>feed.scrollHeight-100;
   if(near) feed.scrollTop=feed.scrollHeight;
-  // big "now" caption
-  $("nowcap").innerHTML="";
-  const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+m.speaker; who.style.background=color(m.speaker);
-  const t2=document.createElement("span"); t2.className="txt"; t2.textContent=m.text;
-  $("nowcap").append(who,t2);
+  // current caption: overlay on the video if shown, else the big bar
+  const onVideo=$("vidwrap").style.display!=="none";
+  if(onVideo){
+    $("vidcap").innerHTML="";
+    const box=document.createElement("span");
+    const who=document.createElement("span"); who.className="who"; who.textContent="SPK "+m.speaker; who.style.background=color(m.speaker);
+    box.append(who,document.createTextNode(m.text)); $("vidcap").appendChild(box);
+  }else{
+    $("nowcap").innerHTML="";
+    const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+m.speaker; who.style.background=color(m.speaker); who.style.color="#fff";
+    const t2=document.createElement("span"); t2.className="txt"; t2.textContent=m.text;
+    $("nowcap").append(who,t2);
+  }
 }
 function addMark(m){
   const feed=$("feed"); const row=document.createElement("div"); row.className="cap mark";
