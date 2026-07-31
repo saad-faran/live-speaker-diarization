@@ -165,6 +165,78 @@ class Manager:
         ld.stop = False
         ld.raw = []
         ld.committed_until = 0.0
+        # incremental global re-clustering state (drift-free, consistent IDs)
+        self.gcentroids = {}       # stable_id -> unit centroid (recomputed each recluster)
+        self.gnext = 1
+        self.last_turns = []       # merged global timeline (authoritative IDs)
+        self.cur_global = None
+
+    # ── incremental global re-clustering ─────────────────────────────────────
+    @staticmethod
+    def _merge_keep(turns, merge_gap, min_dur):
+        """Merge adjacent same-ID turns, PRESERVING the ids (unlike LiveDiarizer's
+        _merge_relabel which renumbers)."""
+        merged = []
+        for s, e, sid in sorted(turns):
+            if merged and merged[-1][2] == sid and s - merged[-1][1] <= merge_gap:
+                merged[-1] = [merged[-1][0], max(merged[-1][1], e), sid]
+            else:
+                merged.append([s, e, sid])
+        return [(s, e, sid) for s, e, sid in merged if e - s >= min_dur]
+
+    def _recluster(self):
+        """Re-cluster ALL committed turn embeddings from scratch (drift-free), then
+        RECONCILE the clusters to persistent stable IDs by centroid similarity, so a
+        speaker keeps the same ID across the whole stream no matter how long it runs,
+        and short turns that were provisionally merged get corrected using every
+        speaker's full evidence. Causal (only past turns) → honest online."""
+        from scipy.cluster.hierarchy import linkage, fcluster
+        raw = list(self.ld.raw)
+        items = [(s, e, emb) for (s, e, sid, emb) in raw
+                 if emb is not None and not np.isnan(emb).any()]
+        if len(items) < 3:
+            return None
+        MAX = 2500                                   # bound O(n^2); persistent centroids keep old IDs
+        if len(items) > MAX:
+            items = items[-MAX:]
+        X = np.array([it[2] for it in items], dtype=float)
+        Z = linkage(X, method="average", metric="cosine")
+        lab = fcluster(Z, t=self.args.recluster_dist, criterion="distance")
+        clu = {}
+        for i, c in enumerate(lab):
+            clu.setdefault(int(c), []).append(i)
+
+        def unit(v):
+            return v / (np.linalg.norm(v) + 1e-9)
+        cen = {c: unit(X[idxs].mean(0)) for c, idxs in clu.items()}
+        # reconcile new clusters to existing global IDs (greedy by cosine)
+        pairs = sorted(((float(cen[c] @ gc), c, sid)
+                        for c in cen for sid, gc in self.gcentroids.items()),
+                       reverse=True, key=lambda x: x[0])
+        cmap, used = {}, set()
+        for sim, c, sid in pairs:
+            if c in cmap or sid in used or sim < 0.5:
+                continue
+            cmap[c] = sid; used.add(sid)
+        for c in clu:
+            if c not in cmap:
+                cmap[c] = self.gnext; self.gnext += 1
+        self.gcentroids = {cmap[c]: cen[c] for c in clu}     # recomputed → no EMA drift
+        turns = [(items[i][0], items[i][1], cmap[int(lab[i])]) for i in range(len(items))]
+        return self._merge_keep(turns, self.ld.merge_gap, self.ld.min_change_dur)
+
+    @staticmethod
+    def _roster(merged):
+        info = {}
+        last = None
+        for s, e, sid in merged:
+            d = info.setdefault(sid, {"turns": 0, "talk": 0.0, "last_t": 0.0})
+            d["talk"] += e - s
+            d["last_t"] = max(d["last_t"], e)
+            if sid != last:
+                d["turns"] += 1; last = sid
+        return [{"speaker": sid, "turns": d["turns"], "talk": round(d["talk"], 1),
+                 "last_t": round(d["last_t"], 1)} for sid, d in sorted(info.items())]
 
     # ── session control (called from the WS handler / async loop) ────────────
     def start(self, url):
@@ -253,12 +325,9 @@ class Manager:
         overlap = a.asr_overlap
         next_diar = ld.stride
         next_asr = a.asr_interval
-        cur = None
-        changes = 0
-        seen = set()
-        stats = {}                      # sid -> {turns, talk, last_t}
+        next_clock = 1.0
+        next_recluster = a.recluster_sec if a.recluster_sec > 0 else float("inf")
         recent = []
-        last_stats = 0.0
 
         while not self.stop_evt.is_set():
             raw = self.proc.stdout.read(step)
@@ -271,42 +340,41 @@ class Manager:
             self.media_t = media_t
             asr_audio = np.concatenate([asr_audio, pkt])
 
-            # ---- diarization ----
+            # ---- diarization: commit fine-grained turns into ld.raw ----
             if media_t >= next_diar:
                 next_diar = media_t + ld.stride
                 buf, tot = ld._snapshot()
                 if len(buf) >= ld.warmup_n:
                     ld.process(buf, tot / SR)
-                    blocks = ld.finalize()
-                    if blocks:
-                        # per-speaker talk time + roster
-                        talk = {}
-                        for s, e, sid in blocks:
-                            talk[sid] = talk.get(sid, 0.0) + (e - s)
-                        sid = blocks[-1][2]
-                        is_new = sid not in seen
-                        seen.add(sid)
-                        for k in talk:
-                            st = stats.setdefault(k, {"turns": 0, "talk": 0.0, "last_t": 0.0})
-                            st["talk"] = round(talk[k], 1)
-                        if sid != cur:
-                            cur = sid
-                            changes += 1
-                            st = stats.setdefault(sid, {"turns": 0, "talk": 0.0, "last_t": 0.0})
-                            st["turns"] += 1
-                            st["last_t"] = round(media_t, 1)
-                            wall = time.time() - t0
-                            self.log({"type": "speaker", "speaker": sid, "changes": changes,
-                                      "total_speakers": len(seen), "t": round(media_t, 1),
-                                      "is_new": is_new, "latency": round(wall - media_t, 2)})
-                        if media_t - last_stats >= 1.0:
-                            last_stats = media_t
-                            broadcast({"type": "stats", "t": round(media_t, 1),
-                                       "total_speakers": len(seen), "changes": changes,
-                                       "current": cur,
-                                       "roster": [{"speaker": k, "turns": v["turns"],
-                                                   "talk": v["talk"], "last_t": v["last_t"]}
-                                                  for k, v in sorted(stats.items())]})
+
+            # ---- lightweight clock for the dashboard's video-sync frontier ----
+            if media_t >= next_clock:
+                next_clock = media_t + 1.0
+                broadcast({"type": "clock", "t": round(media_t, 1)})
+
+            # ---- incremental global re-clustering → consistent, drift-free IDs ----
+            if media_t >= next_recluster:
+                next_recluster = media_t + a.recluster_sec
+                try:
+                    merged = self._recluster()
+                except Exception as e:
+                    merged = None
+                    broadcast({"type": "status", "msg": f"recluster error: {e}"})
+                if merged:
+                    self.last_turns = merged
+                    self.cur_global = merged[-1][2]
+                    roster = self._roster(merged)
+                    n_changes = sum(1 for i in range(1, len(merged)) if merged[i][2] != merged[i - 1][2])
+                    broadcast({"type": "relabel", "t": round(media_t, 1),
+                               "current": self.cur_global, "total_speakers": len(self.gcentroids),
+                               "changes": n_changes, "roster": roster,
+                               "timeline": [[round(s, 1), round(e, 1), sid] for s, e, sid in merged[-200:]]})
+                    if self.log_f:
+                        self.log_f.write(json.dumps({"type": "relabel", "t": round(media_t, 1),
+                                                     "current": self.cur_global,
+                                                     "total_speakers": len(self.gcentroids),
+                                                     "changes": n_changes, "roster": roster}) + "\n")
+                        self.log_f.flush()
 
             # ---- ASR (overlapping, boundary-safe) ----
             if media_t >= next_asr:
@@ -317,8 +385,10 @@ class Manager:
                 if len(chunk) >= SR:
                     try:
                         segs, _ = self.asr.transcribe(
-                            chunk, language=a.language, beam_size=5, vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
+                            chunk, language=a.language, beam_size=5,
+                            vad_filter=not a.no_vad,
+                            vad_parameters=dict(threshold=0.3, min_silence_duration_ms=300,
+                                                min_speech_duration_ms=0, speech_pad_ms=200),
                             condition_on_previous_text=False, word_timestamps=True)
                         blocks = ld.finalize()
                         for sg in segs:
@@ -339,11 +409,12 @@ class Manager:
                                 continue
                             emitted_until = max(emitted_until, a_end)
                             mid = (a_start + a_end) / 2.0
-                            spk = _speaker_at(blocks, mid)
+                            spk_g = _speaker_at(self.last_turns, mid)   # authoritative global ID
+                            spk_o = _speaker_at(blocks, mid)            # online presence (for flags)
                             dur = max(a_end - a_start, 0.1)
-                            flags = _hallucination_flags(txt, dur, spk, recent)
+                            flags = _hallucination_flags(txt, dur, spk_o, recent)
                             recent.append(txt); recent[:] = recent[-5:]
-                            disp = spk if spk is not None else (cur or 1)
+                            disp = spk_g if spk_g is not None else (self.cur_global or 1)
                             wall = time.time() - t0
                             self.log({"type": "caption", "speaker": disp, "text": txt,
                                       "t": round(a_start, 1), "end_t": round(a_end, 1),
@@ -411,10 +482,17 @@ async def main_async(args):
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Paste-a-URL live diarization console.")
-    ap.add_argument("--asr-model", default="small", help="faster-whisper: tiny|base|small|medium")
+    ap.add_argument("--asr-model", default="medium",
+                    help="faster-whisper: tiny|base|small|medium|large-v3 (heavier = more accurate)")
     ap.add_argument("--asr-interval", type=float, default=2.5,
                     help="transcribe every N s — LOWER = lower caption latency (needs a fast GPU)")
     ap.add_argument("--asr-overlap", type=float, default=2.0)
+    ap.add_argument("--no-vad", action="store_true",
+                    help="disable VAD filtering (captures every word; may hallucinate on silence/music)")
+    ap.add_argument("--recluster-sec", type=float, default=5.0,
+                    help="re-cluster all turns every N s for consistent, drift-free IDs (0 disables)")
+    ap.add_argument("--recluster-dist", type=float, default=0.55,
+                    help="agglomerative distance cutoff for re-clustering (lower = more speakers)")
     ap.add_argument("--stride", type=float, default=1.0,
                     help="diarization commit cadence (s) — lower = faster speaker switches")
     ap.add_argument("--commit-lag", type=float, default=0.75,

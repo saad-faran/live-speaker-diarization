@@ -15,7 +15,7 @@
   #status{margin-left:auto;font-size:12px;color:var(--muted)}
   .clock{font-family:ui-monospace,monospace;font-size:13px;color:var(--muted)}
   .syncbar{display:flex;gap:12px;align-items:center;padding:7px 16px;background:#101424;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
-  .syncbar input[type=range]{width:180px}
+  .syncbar input[type=range]{width:200px}
   main{flex:1 1 auto;display:flex;min-height:0}
   .left{flex:1 1 64%;display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
   .vidwrap{background:#000;flex:0 0 auto;position:relative}
@@ -39,12 +39,16 @@
   .side{flex:1 1 36%;min-width:270px;display:flex;flex-direction:column}
   .sidehead{padding:11px 16px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center}
   .kpi{display:flex;flex-direction:column;line-height:1.1}.kpi b{font-size:22px}.kpi span{font-size:10px;color:var(--muted)}
-  #roster{flex:1 1 auto;overflow:auto;padding:8px 12px 40px}
-  .spk{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;margin-bottom:6px;background:#11152a;border:1px solid var(--line)}
-  .spk.cur{outline:2px solid #fff}
+  #roster{flex:1 1 auto;overflow:auto;padding:8px 12px 40px;scroll-behavior:smooth}
+  .spk{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;margin-bottom:6px;background:#11152a;border:1px solid var(--line);transition:background .15s,transform .15s}
+  .spk.cur{background:#1c2547;border-color:#fff;box-shadow:0 0 0 2px #fff,0 0 16px rgba(255,255,255,.25);transform:scale(1.02)}
   .dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto}
+  .spk.cur .dot{width:18px;height:18px}
   .spk .name{font-weight:700;font-size:14px}
+  .spk.cur .name{font-size:16px}
+  .speaking{font-size:9px;background:var(--good);color:#04220f;padding:1px 7px;border-radius:8px;font-weight:800;margin-left:8px;vertical-align:2px}
   .spk .meta{margin-left:auto;text-align:right;font-family:ui-monospace,monospace;font-size:11px;color:var(--muted)}
+  .spk.cur .meta{color:#dfe}
   .hint{color:var(--muted);font-size:11px;padding:8px 16px;line-height:1.5}
   a.dl{color:#7db8ff;font-size:12px;text-decoration:none;margin-left:6px}
 </style></head>
@@ -60,10 +64,10 @@
 </header>
 <div class="syncbar">
   <label><input type="checkbox" id="syncchk" checked> Sync video to captions</label>
-  <span>fine-tune offset</span>
-  <input type="range" id="offset" min="-5" max="5" step="0.25" value="0">
+  <span>hold video behind</span>
+  <input type="range" id="offset" min="-10" max="10" step="0.5" value="0">
   <span id="offlabel" class="clock">0.0s</span>
-  <span style="margin-left:auto">When synced, the video is held back so subtitles + speaker match what you hear.</span>
+  <span style="margin-left:auto" id="offnote2">The video is held back so subtitles + speaker match what you hear (up to 10s).</span>
 </div>
 <main>
   <div class="left">
@@ -84,86 +88,84 @@
         <a class="dl" id="dlsrt" href="/session.srt" download>⤓ srt</a>
       </div>
     </div>
-    <div class="hint">Each speaker is a persistent ID (color-matched to the captions). "turns" counts every
-      (re)appearance; "talk" is total speaking time. See a wrong label? type a note and hit
-      <b>Mark issue</b> — it timestamps the log so it's easy to send back for fixing.</div>
+    <div class="hint">IDs are re-clustered continuously so they stay consistent for the whole stream.
+      The <b>speaking</b> speaker is highlighted and auto-scrolled into view. See a wrong label? type a
+      note and hit <b>Mark issue</b> — it timestamps the log for easy fixing.</div>
     <div id="roster"></div>
   </div>
 </main>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-const PALETTE=["#3498DB","#2ECC71","#E74C3C","#F39C12","#9B59B6","#1ABC9C","#E91E63","#FF9800","#34495E","#16A085"];
+const PALETTE=["#3498DB","#2ECC71","#E74C3C","#F39C12","#9B59B6","#1ABC9C","#E91E63","#FF9800","#34495E","#16A085","#D35400","#7F8C8D","#27AE60","#2980B9","#C0392B","#8E44AD"];
 const color=id=>PALETTE[((id||1)-1)%PALETTE.length];
 const fmt=t=>{t=Math.max(0,t|0);const h=t/3600|0,m=(t%3600)/60|0,s=t%60;return (h?String(h).padStart(2,"0")+":":"")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")};
 const $=id=>document.getElementById(id);
 let ws=null;
 
-// ---- YouTube player + sync state ----
-let apiReady=false, player=null, curId=null;
-let ytOrigin=null;           // maps player time -> pipeline media time
-let frontier=0;              // latest media time the pipeline has produced
-let capBuf=[];               // captions awaiting reveal (when synced)
-let lastStats=null, lastRevealSpk=null;
+// ---- YouTube player + sync ----
+let apiReady=false, player=null, curId=null, ytOrigin=null, frontier=0;
+let capBuf=[], capRows=[], lastRevealSpk=null;
+let lastTimeline=[], lastRoster=null, lastTotal=0, lastChanges=0, lastCurrent=null;
 window.onYouTubeIframeAPIReady=()=>{ apiReady=true; };
 
 function ytId(u){ const m=u.match(/(?:v=|youtu\.be\/|\/live\/|\/embed\/|shorts\/)([A-Za-z0-9_-]{11})/); return m?m[1]:null; }
-
 function startVideo(id){
   curId=id; ytOrigin=null;
   if(!apiReady){ setTimeout(()=>startVideo(id),300); return; }
   $("vidwrap").style.display="block"; $("nowcap").style.display="none";
   if(player && player.loadVideoById){ player.loadVideoById(id); }
-  else{
-    player=new YT.Player('player',{videoId:id,
-      playerVars:{autoplay:1,mute:1,controls:1,rel:0},
-      events:{onReady:e=>{e.target.mute();e.target.playVideo();}}});
+  else player=new YT.Player('player',{videoId:id,playerVars:{autoplay:1,mute:1,controls:1,rel:0},
+    events:{onReady:e=>{e.target.mute();e.target.playVideo();}}});
+}
+function noVideo(){ $("vidwrap").style.display="none"; $("nowcap").style.display="flex"; if(player&&player.stopVideo) try{player.stopVideo();}catch(e){} }
+function synced(){ return $("syncchk").checked && player && player.getCurrentTime && curId; }
+function videoMedia(){ const ct=player.getCurrentTime()||0; if(ytOrigin===null && frontier>0) ytOrigin=ct-frontier;
+  return ytOrigin===null?0:(ct-ytOrigin+parseFloat($("offset").value)); }
+function spkAt(tl,t){ let best=null; for(const seg of tl){ if(seg[0]<=t && t<seg[1]) return seg[2]; if(seg[0]<=t) best=seg[2]; } return best; }
+
+function setOverlay(sid,text){
+  if($("vidwrap").style.display!=="none"){
+    $("vidcap").innerHTML=""; const box=document.createElement("span");
+    const who=document.createElement("span"); who.className="who"; who.textContent="SPK "+sid; who.style.background=color(sid);
+    box.append(who,document.createTextNode(text)); $("vidcap").appendChild(box);
+  }else{
+    $("nowcap").innerHTML=""; const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+sid; who.style.background=color(sid);
+    const t2=document.createElement("span"); t2.className="txt"; t2.textContent=text; $("nowcap").append(who,t2);
   }
 }
-function noVideo(){ $("vidwrap").style.display="none"; $("nowcap").style.display="flex";
-  if(player&&player.stopVideo) try{player.stopVideo();}catch(e){} }
-
-function synced(){ return $("syncchk").checked && player && player.getCurrentTime && curId; }
-function videoMedia(){
-  const ct=player.getCurrentTime()||0;
-  if(ytOrigin===null && frontier>0) ytOrigin=ct-frontier;      // align "now" once
-  return ytOrigin===null?0:(ct-ytOrigin+parseFloat($("offset").value));
-}
-
 function revealCap(m){
-  const feed=$("feed"), flag=(m.flags&&m.flags.length);
+  const feed=$("feed");
+  let sid=lastTimeline.length? spkAt(lastTimeline,m.t):null; if(sid==null) sid=m.speaker;
+  const flag=(m.flags&&m.flags.length);
   const row=document.createElement("div"); row.className="cap"+(flag?" flagged":"");
   const time=document.createElement("div"); time.className="time"; time.textContent=fmt(m.t);
-  const tag=document.createElement("div"); tag.className="tag"; tag.textContent="SPK "+m.speaker; tag.style.background=color(m.speaker);
+  const tag=document.createElement("div"); tag.className="tag"; tag.textContent="SPK "+sid; tag.style.background=color(sid);
   const body=document.createElement("div");
   const txt=document.createElement("div"); txt.className="txt"; txt.textContent=(flag?"⚠ ":"")+m.text; body.appendChild(txt);
   if(flag){const f=document.createElement("div");f.className="flags";f.textContent=m.flags.join(", ");body.appendChild(f);}
   row.append(time,tag,body); feed.appendChild(row);
+  capRows.push({t:m.t,sid,tag}); while(capRows.length>300){ capRows.shift(); if(feed.firstChild) feed.firstChild.remove(); }
   const near=feed.scrollTop+feed.clientHeight>feed.scrollHeight-100; if(near) feed.scrollTop=feed.scrollHeight;
-  lastRevealSpk=m.speaker;
-  const onVideo=$("vidwrap").style.display!=="none";
-  if(onVideo){
-    $("vidcap").innerHTML=""; const box=document.createElement("span");
-    const who=document.createElement("span"); who.className="who"; who.textContent="SPK "+m.speaker; who.style.background=color(m.speaker);
-    box.append(who,document.createTextNode(m.text)); $("vidcap").appendChild(box);
-  }else{
-    $("nowcap").innerHTML=""; const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+m.speaker; who.style.background=color(m.speaker);
-    const t2=document.createElement("span"); t2.className="txt"; t2.textContent=m.text; $("nowcap").append(who,t2);
-  }
-  if(lastStats) renderRoster(lastStats);
+  lastRevealSpk=sid; setOverlay(sid,m.text); renderRoster();
 }
-function renderRoster(m){
-  lastStats=m;
-  $("nspk").textContent=m.total_speakers; $("nchg").textContent=m.changes;
-  const cur = synced()? lastRevealSpk : m.current;
-  const el=$("roster"); el.innerHTML="";
-  for(const s of m.roster){
+function recolorAll(){
+  for(const r of capRows){ const sid=spkAt(lastTimeline,r.t); if(sid==null||sid===r.sid) continue;
+    r.sid=sid; r.tag.textContent="SPK "+sid; r.tag.style.background=color(sid); }
+}
+function renderRoster(){
+  if(!lastRoster) return;
+  $("nspk").textContent=lastTotal; $("nchg").textContent=lastChanges;
+  const cur = synced()? lastRevealSpk : lastCurrent;
+  const el=$("roster"); el.innerHTML=""; let curRow=null;
+  for(const s of lastRoster){
     const row=document.createElement("div"); row.className="spk"+(s.speaker===cur?" cur":"");
     const dot=document.createElement("div"); dot.className="dot"; dot.style.background=color(s.speaker);
     const name=document.createElement("div"); name.className="name"; name.textContent="SPEAKER "+s.speaker;
-    const meta=document.createElement("div"); meta.className="meta";
-    meta.innerHTML=`${s.turns} turn${s.turns===1?"":"s"} · ${fmt(s.talk)}<br>last ${fmt(s.last_t)}`;
-    row.append(dot,name,meta); el.appendChild(row);
+    if(s.speaker===cur){ const b=document.createElement("span"); b.className="speaking"; b.textContent="● speaking"; name.appendChild(b); }
+    const meta=document.createElement("div"); meta.className="meta"; meta.innerHTML=`${s.turns} turn${s.turns===1?"":"s"} · ${fmt(s.talk)}<br>last ${fmt(s.last_t)}`;
+    row.append(dot,name,meta); el.appendChild(row); if(s.speaker===cur) curRow=row;
   }
+  if(curRow) curRow.scrollIntoView({block:"nearest"});
 }
 function addMark(m){
   const feed=$("feed"); const row=document.createElement("div"); row.className="cap mark";
@@ -172,28 +174,27 @@ function addMark(m){
   row.append(time,body); feed.appendChild(row); feed.scrollTop=feed.scrollHeight;
 }
 
-// ---- sync loop: hold the video at the caption frontier, reveal by video clock ----
 function loop(){
   if(synced()){
     const vm=videoMedia();
-    const st=player.getPlayerState?player.getPlayerState():1;   // 1 playing, 2 paused
-    if(vm > frontier-0.15){ if(st===1) try{player.pauseVideo();}catch(e){} }        // wait for pipeline
-    else if(vm < frontier-0.8){ if(st===2) try{player.playVideo();}catch(e){} }     // catch back up
+    const st=player.getPlayerState?player.getPlayerState():1;
+    if(vm > frontier-0.15){ if(st===1) try{player.pauseVideo();}catch(e){} }
+    else if(vm < frontier-0.8){ if(st===2) try{player.playVideo();}catch(e){} }
     capBuf.sort((a,b)=>a.t-b.t);
     while(capBuf.length && capBuf[0].t <= vm+0.05) revealCap(capBuf.shift());
     $("clock").textContent=fmt(vm);
     $("offnote").textContent=`synced · ${(frontier-vm).toFixed(1)}s behind live`;
   }else{
-    while(capBuf.length) revealCap(capBuf.shift());            // no sync: reveal immediately
+    while(capBuf.length) revealCap(capBuf.shift());
     if($("vidwrap").style.display!=="none") $("offnote").textContent="not synced (captions lag video)";
   }
 }
-// setInterval (not rAF) so reveal keeps working even when the tab is unfocused
 setInterval(loop, 100);
 
 $("offset").oninput=()=>$("offlabel").textContent=parseFloat($("offset").value).toFixed(1)+"s";
 function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
-$("start").onclick=()=>{ const u=$("url").value.trim(); if(!u)return; $("feed").innerHTML=""; capBuf=[]; frontier=0; ytOrigin=null; lastRevealSpk=null;
+$("start").onclick=()=>{ const u=$("url").value.trim(); if(!u)return;
+  $("feed").innerHTML=""; capBuf=[]; capRows=[]; frontier=0; ytOrigin=null; lastRevealSpk=null; lastTimeline=[]; lastRoster=null;
   const id=ytId(u); if(id) startVideo(id); else noVideo(); send({cmd:"start",url:u}); };
 $("stop").onclick =()=> send({cmd:"stop"});
 $("mark").onclick =()=>{ send({cmd:"mark",note:$("note").value.trim()}); $("note").value=""; };
@@ -207,10 +208,14 @@ function connect(){
     const m=JSON.parse(ev.data);
     if(m.type==="status"){$("status").textContent=m.msg;}
     else if(m.type==="session"){$("status").textContent="● "+m.url;}
+    else if(m.type==="clock"){ frontier=Math.max(frontier,m.t); }
     else if(m.type==="caption"){ frontier=Math.max(frontier,m.end_t||m.t); capBuf.push(m); }
     else if(m.type==="marked"){addMark(m);}
-    else if(m.type==="stats"){ frontier=Math.max(frontier,m.t); renderRoster(m); }
-    else if(m.type==="speaker"){ frontier=Math.max(frontier,m.t); }
+    else if(m.type==="relabel"){
+      frontier=Math.max(frontier,m.t); lastTimeline=m.timeline||[]; lastRoster=m.roster;
+      lastTotal=m.total_speakers; lastChanges=m.changes; lastCurrent=m.current;
+      recolorAll(); renderRoster();
+    }
   };
 }
 connect();
