@@ -243,6 +243,7 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
     changes = 0
     seen = set()
     recent_texts = []
+    last_word = ""
     n_caps = 0
     n_flagged = 0
 
@@ -299,17 +300,22 @@ def pipeline(args, audio, video_url, log_f, srt, media_dur):
                         vad_filter=True, vad_parameters=dict(min_silence_duration_ms=400),
                         condition_on_previous_text=False, word_timestamps=True)
                     blocks = ld.finalize()
+                    norm = lambda s: s.strip().lower().strip(".,!?\"'-")
                     for sg in segs:
-                        # keep only words we haven't emitted yet (drops the overlap
-                        # region cleanly -> no repeated words, no clipped words)
+                        # START-based dedup: keep only words that begin at/after what we've
+                        # already emitted (drops the overlap region without re-showing a
+                        # boundary word the overlap re-transcribes with a shifted timestamp).
                         words = [w for w in (sg.words or [])
-                                 if seg_from + w.end > emitted_until + 0.05]
+                                 if seg_from + w.start >= emitted_until - 0.10]
+                        while words and last_word and norm(words[0].word) == last_word:
+                            words = words[1:]
                         if sg.words:
                             if not words:
                                 continue
                             txt = "".join(w.word for w in words).strip()
                             a_start = seg_from + words[0].start
                             a_end = seg_from + words[-1].end
+                            last_word = norm(words[-1].word)
                         else:                                 # no word timestamps -> segment-level
                             txt = sg.text.strip()
                             a_start, a_end = seg_from + sg.start, seg_from + sg.end

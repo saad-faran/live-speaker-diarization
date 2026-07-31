@@ -328,6 +328,7 @@ class Manager:
         next_clock = 1.0
         next_recluster = a.recluster_sec if a.recluster_sec > 0 else float("inf")
         recent = []
+        last_word = ""
 
         while not self.stop_evt.is_set():
             raw = self.proc.stdout.read(step)
@@ -391,15 +392,23 @@ class Manager:
                                                 min_speech_duration_ms=0, speech_pad_ms=200),
                             condition_on_previous_text=False, word_timestamps=True)
                         blocks = ld.finalize()
+                        norm = lambda s: s.strip().lower().strip(".,!?\"'-")
                         for sg in segs:
+                            # START-based dedup: keep only words that begin at/after what we've
+                            # already emitted, so a boundary word the overlap re-transcribes
+                            # (with a slightly shifted end time) is not shown twice.
                             words = [w for w in (sg.words or [])
-                                     if seg_from + w.end > emitted_until + 0.05]
+                                     if seg_from + w.start >= emitted_until - 0.10]
+                            # belt-and-suspenders: strip leading word(s) that repeat the last emitted
+                            while words and last_word and norm(words[0].word) == last_word:
+                                words = words[1:]
                             if sg.words:
                                 if not words:
                                     continue
                                 txt = "".join(w.word for w in words).strip()
                                 a_start = seg_from + words[0].start
                                 a_end = seg_from + words[-1].end
+                                last_word = norm(words[-1].word)
                             else:
                                 txt = sg.text.strip()
                                 a_start, a_end = seg_from + sg.start, seg_from + sg.end
