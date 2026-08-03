@@ -105,7 +105,9 @@ def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_compo
     if extra_args:
         base += list(extra_args)
     last_err = ""
-    for fmt in ["91", "bestaudio/best"]:           # 91 = YouTube live HLS (audio-cheap)
+    # site-agnostic: prefer audio-only, then a combined stream; 91 is a last-ditch
+    # YouTube-live format id (harmless elsewhere).
+    for fmt in ["bestaudio/best", "best", "91"]:
         try:
             out = subprocess.run(base + ["-f", fmt, "-g", url],
                                  capture_output=True, text=True, timeout=90)
@@ -118,9 +120,10 @@ def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_compo
     raise RuntimeError(
         "Could not resolve a playable stream URL.\n"
         f"  yt-dlp said: {last_err}\n"
-        "  For a live YouTube URL, YouTube's anti-bot challenge is likely blocking it — see\n"
-        "  the README 'Live YouTube' section (cookies + deno + --remote-components).\n"
-        "  Direct HLS/RTMP/SRT URLs and --simulate need none of that.")
+        "  yt-dlp supports Rumble, Twitch, Kick, Dailymotion and ~1800 sites — most need no\n"
+        "  extra flags. YouTube specifically has an anti-bot challenge (see the README\n"
+        "  'Live YouTube' section, or try --yt-player-client tv,web_safari).\n"
+        "  A direct HLS/RTMP/SRT (.m3u8) URL needs no yt-dlp at all.")
 
 
 def to_16k_mono_wav(path):
