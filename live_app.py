@@ -305,7 +305,8 @@ class Manager:
             self.log({"type": "status", "msg": "resolving stream…"})
             src = resolve_stream(url, cookies_from_browser=a.cookies_from_browser,
                                  js_runtime=a.js_runtime, remote_components=a.remote_components,
-                                 cookies=a.cookies)
+                                 cookies=a.cookies, player_client=a.yt_player_client,
+                                 extra_args=a.ytdlp_arg)
         except Exception as e:
             self.log({"type": "status", "msg": f"could not open URL: {e}"})
             return
@@ -515,6 +516,11 @@ def main():
                          "fails, e.g. Chrome's locked cookie DB on Windows)")
     ap.add_argument("--js-runtime", default=None)
     ap.add_argument("--remote-components", default=None)
+    ap.add_argument("--yt-player-client", default=None,
+                    help="YouTube client(s) to avoid the JS challenge (no deno needed), "
+                         "e.g. tv,web_safari,android — use when Application Control blocks deno")
+    ap.add_argument("--ytdlp-arg", action="append", default=None,
+                    help="extra raw yt-dlp argument (repeatable)")
     args = ap.parse_args()
     try:
         asyncio.run(main_async(args))

@@ -80,11 +80,14 @@ def is_direct_stream(url):
 
 
 def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_components=None,
-                   cookies=None):
+                   cookies=None, player_client=None, extra_args=None):
     """Resolve a URL to a direct media URL ffmpeg can read.
     Direct stream URLs (HLS/RTMP/SRT/…) bypass yt-dlp entirely.
     `cookies` = path to an exported cookies.txt (use when --cookies-from-browser
-    fails, e.g. Chrome's locked/app-bound-encrypted cookie DB on Windows)."""
+    fails, e.g. Chrome's locked/app-bound-encrypted cookie DB on Windows).
+    `player_client` = yt-dlp YouTube client(s) e.g. 'tv,web_safari,android' — these
+    avoid the JS n-challenge entirely, so no deno/--remote-components is needed
+    (useful when Windows Application Control blocks the JS runtime)."""
     if is_direct_stream(url):
         return url
     ytdlp = _tool("yt-dlp")
@@ -97,6 +100,10 @@ def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_compo
         base += ["--js-runtimes", js_runtime]
     if remote_components:
         base += ["--remote-components", remote_components]
+    if player_client:
+        base += ["--extractor-args", f"youtube:player_client={player_client}"]
+    if extra_args:
+        base += list(extra_args)
     last_err = ""
     for fmt in ["91", "bestaudio/best"]:           # 91 = YouTube live HLS (audio-cheap)
         try:
