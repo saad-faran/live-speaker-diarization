@@ -178,8 +178,11 @@ function loop(){
   if(synced()){
     const vm=videoMedia();
     const st=player.getPlayerState?player.getPlayerState():1;
-    if(vm > frontier-0.15){ if(st===1) try{player.pauseVideo();}catch(e){} }
-    else if(vm < frontier-0.8){ if(st===2) try{player.playVideo();}catch(e){} }
+    // Keep the video PLAYING. Only pause it if it has actually run past the
+    // transcribed edge (the pipeline briefly fell behind) — then resume as soon
+    // as more captions arrive. This avoids the "plays a frame then pauses" stutter.
+    if(ytOrigin!==null && vm > frontier + 0.4){ if(st===1) try{player.pauseVideo();}catch(e){} }
+    else if(st===2){ try{player.playVideo();}catch(e){} }
     capBuf.sort((a,b)=>a.t-b.t);
     while(capBuf.length && capBuf[0].t <= vm+0.05) revealCap(capBuf.shift());
     $("clock").textContent=fmt(vm);
