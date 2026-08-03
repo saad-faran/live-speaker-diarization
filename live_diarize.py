@@ -71,6 +71,20 @@ def _tool(name):
     return exe
 
 
+def _ytdlp_base():
+    """yt-dlp invocation. Prefer `python -m yt_dlp` (runs via the current, allowed
+    Python) over the yt-dlp.exe launcher — Windows Application Control / Smart App
+    Control can block the standalone .exe ('An Application Control policy has blocked
+    this file'). Falls back to the binary only if the module isn't importable."""
+    import importlib.util
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    exe = shutil.which("yt-dlp")
+    if exe:
+        return [exe]
+    sys.exit("ERROR: yt-dlp not available. Install it: pip install -U yt-dlp")
+
+
 def is_direct_stream(url):
     """A URL ffmpeg can read directly (no yt-dlp needed)."""
     u = url.lower()
@@ -90,8 +104,7 @@ def resolve_stream(url, cookies_from_browser=None, js_runtime=None, remote_compo
     (useful when Windows Application Control blocks the JS runtime)."""
     if is_direct_stream(url):
         return url
-    ytdlp = _tool("yt-dlp")
-    base = [ytdlp, "--no-warnings"]
+    base = _ytdlp_base() + ["--no-warnings"]
     if cookies:
         base += ["--cookies", cookies]
     if cookies_from_browser:
@@ -136,8 +149,7 @@ def to_16k_mono_wav(path):
 
 def download_video(url, out, cookies=None, js=None, remote=None, cookies_file=None):
     """Download a YouTube (or other) video with audio, as an mp4."""
-    ytdlp = _tool("yt-dlp")
-    cmd = [ytdlp, "--no-warnings", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out]
+    cmd = _ytdlp_base() + ["--no-warnings", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out]
     if cookies_file:
         cmd += ["--cookies", cookies_file]
     if cookies:
