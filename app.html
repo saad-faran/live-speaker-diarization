@@ -186,15 +186,16 @@ function loop(){
   if(synced()){
     const vm=videoMedia();
     const st=player.getPlayerState?player.getPlayerState():1;
-    // Keep the video PLAYING. Only pause it if it has actually run past the
-    // transcribed edge (the pipeline briefly fell behind) — then resume as soon
-    // as more captions arrive. This avoids the "plays a frame then pauses" stutter.
-    if(ytOrigin!==null && vm > frontier + 0.4){ if(st===1) try{player.pauseVideo();}catch(e){} }
-    else if(st===2){ try{player.playVideo();}catch(e){} }
+    // NEVER auto-pause the video — always keep it playing. Captions reveal as the
+    // video reaches them; if the pipeline is momentarily behind, they just appear a
+    // little late rather than stalling playback.
+    if(st===2){ try{player.playVideo();}catch(e){} }
     capBuf.sort((a,b)=>a.t-b.t);
-    while(capBuf.length && capBuf[0].t <= vm+0.05) revealCap(capBuf.shift());
+    const upto = Math.max(vm, frontier) + 0.05;   // don't let captions get stuck if video runs ahead
+    while(capBuf.length && capBuf[0].t <= upto) revealCap(capBuf.shift());
     $("clock").textContent=fmt(vm);
-    $("offnote").textContent=`synced · ${(frontier-vm).toFixed(1)}s behind live`;
+    const gap=frontier-vm;
+    $("offnote").textContent = gap>=0 ? `captions ${gap.toFixed(1)}s behind video` : `video ${(-gap).toFixed(1)}s behind captions`;
   }else{
     while(capBuf.length) revealCap(capBuf.shift());
     if($("vidwrap").style.display!=="none") $("offnote").textContent="not synced (captions lag video)";
