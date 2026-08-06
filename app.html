@@ -106,6 +106,8 @@ let ws=null;
 let apiReady=false, player=null, curId=null, ytOrigin=null, frontier=0;
 let capBuf=[], capRows=[], lastRevealSpk=null;
 let lastTimeline=[], lastRoster=null, lastTotal=0, lastChanges=0, lastCurrent=null;
+let fastCurrent=null, fastProvisional=false;
+const NEUTRAL="7A8699";
 window.onYouTubeIframeAPIReady=()=>{ apiReady=true; };
 
 function ytId(u){ const m=u.match(/(?:v=|youtu\.be\/|\/live\/|\/embed\/|shorts\/)([A-Za-z0-9_-]{11})/); return m?m[1]:null; }
@@ -123,39 +125,45 @@ function videoMedia(){ const ct=player.getCurrentTime()||0; if(ytOrigin===null &
   return ytOrigin===null?0:(ct-ytOrigin+parseFloat($("offset").value)); }
 function spkAt(tl,t){ let best=null; for(const seg of tl){ if(seg[0]<=t && t<seg[1]) return seg[2]; if(seg[0]<=t) best=seg[2]; } return best; }
 
-function setOverlay(sid,text){
+function setOverlay(sid,text,prov){
+  const label = prov? "identifying…" : ("SPK "+sid);
+  const col = prov? NEUTRAL : color(sid);
   if($("vidwrap").style.display!=="none"){
     $("vidcap").innerHTML=""; const box=document.createElement("span");
-    const who=document.createElement("span"); who.className="who"; who.textContent="SPK "+sid; who.style.background=color(sid);
+    const who=document.createElement("span"); who.className="who"; who.textContent=label; who.style.background=col;
     box.append(who,document.createTextNode(text)); $("vidcap").appendChild(box);
   }else{
-    $("nowcap").innerHTML=""; const who=document.createElement("span"); who.className="who"; who.textContent="SPEAKER "+sid; who.style.background=color(sid);
+    $("nowcap").innerHTML=""; const who=document.createElement("span"); who.className="who"; who.textContent=prov?"identifying…":("SPEAKER "+sid); who.style.background=col;
     const t2=document.createElement("span"); t2.className="txt"; t2.textContent=text; $("nowcap").append(who,t2);
   }
 }
 function revealCap(m){
   const feed=$("feed");
-  let sid=lastTimeline.length? spkAt(lastTimeline,m.t):null; if(sid==null) sid=m.speaker;
+  let sid=lastTimeline.length? spkAt(lastTimeline,m.t):null;
+  let prov=false;
+  if(sid==null){ if(m.provisional){ prov=true; } sid=m.speaker; }   // provisional until reclustered
   const flag=(m.flags&&m.flags.length);
   const row=document.createElement("div"); row.className="cap"+(flag?" flagged":"");
   const time=document.createElement("div"); time.className="time"; time.textContent=fmt(m.t);
-  const tag=document.createElement("div"); tag.className="tag"; tag.textContent="SPK "+sid; tag.style.background=color(sid);
+  const tag=document.createElement("div"); tag.className="tag"; tag.textContent=prov?"…":("SPK "+sid); tag.style.background=prov?NEUTRAL:color(sid);
   const body=document.createElement("div");
   const txt=document.createElement("div"); txt.className="txt"; txt.textContent=(flag?"⚠ ":"")+m.text; body.appendChild(txt);
   if(flag){const f=document.createElement("div");f.className="flags";f.textContent=m.flags.join(", ");body.appendChild(f);}
   row.append(time,tag,body); feed.appendChild(row);
-  capRows.push({t:m.t,sid,tag}); while(capRows.length>300){ capRows.shift(); if(feed.firstChild) feed.firstChild.remove(); }
+  capRows.push({t:m.t,sid,tag,prov}); while(capRows.length>300){ capRows.shift(); if(feed.firstChild) feed.firstChild.remove(); }
   const near=feed.scrollTop+feed.clientHeight>feed.scrollHeight-100; if(near) feed.scrollTop=feed.scrollHeight;
-  lastRevealSpk=sid; setOverlay(sid,m.text); renderRoster();
+  if(!prov) lastRevealSpk=sid; setOverlay(sid,m.text,prov); renderRoster();
 }
 function recolorAll(){
-  for(const r of capRows){ const sid=spkAt(lastTimeline,r.t); if(sid==null||sid===r.sid) continue;
-    r.sid=sid; r.tag.textContent="SPK "+sid; r.tag.style.background=color(sid); }
+  for(const r of capRows){ const sid=spkAt(lastTimeline,r.t); if(sid==null) continue;
+    if(sid===r.sid && !r.prov) continue;
+    r.sid=sid; r.prov=false; r.tag.textContent="SPK "+sid; r.tag.style.background=color(sid); }
 }
 function renderRoster(){
   if(!lastRoster) return;
   $("nspk").textContent=lastTotal; $("nchg").textContent=lastChanges;
-  const cur = synced()? lastRevealSpk : lastCurrent;
+  const cur = fastProvisional ? null
+            : (fastCurrent!=null ? fastCurrent : (synced()? lastRevealSpk : lastCurrent));
   const el=$("roster"); el.innerHTML=""; let curRow=null;
   for(const s of lastRoster){
     const row=document.createElement("div"); row.className="spk"+(s.speaker===cur?" cur":"");
@@ -212,6 +220,7 @@ function connect(){
     if(m.type==="status"){$("status").textContent=m.msg;}
     else if(m.type==="session"){$("status").textContent="● "+m.url;}
     else if(m.type==="clock"){ frontier=Math.max(frontier,m.t); }
+    else if(m.type==="current"){ fastCurrent=m.speaker; fastProvisional=!!m.provisional; renderRoster(); }
     else if(m.type==="caption"){ frontier=Math.max(frontier,m.end_t||m.t); capBuf.push(m); }
     else if(m.type==="marked"){addMark(m);}
     else if(m.type==="relabel"){

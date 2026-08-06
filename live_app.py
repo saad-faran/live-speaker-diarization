@@ -44,6 +44,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 import websockets
+import torch
 from core import pick_device, load_pipeline, SpeakerRegistry, ensure_av
 from live_diarize import resolve_stream, _tool, SR, LiveDiarizer
 
@@ -121,6 +122,17 @@ def _speaker_at(blocks, t):
     return best
 
 
+def _reg_at(raw, t):
+    """Registry stable-id of the committed turn active at time t (raw = ld.raw)."""
+    best = None
+    for s, e, sid, _emb in raw:
+        if s <= t < e:
+            return sid
+        if s <= t:
+            best = sid
+    return best
+
+
 class Manager:
     """Owns the single reusable engine and the current streaming session."""
 
@@ -170,6 +182,8 @@ class Manager:
         self.gnext = 1
         self.last_turns = []       # merged global timeline (authoritative IDs)
         self.cur_global = None
+        self.reg2global = {}       # registry stable_id -> global id (for FRESH-tail tagging)
+        self.fast_sid = None       # fast detector's current speaker ('NEW' = provisional)
 
     # ── incremental global re-clustering ─────────────────────────────────────
     @staticmethod
@@ -192,7 +206,7 @@ class Manager:
         speaker's full evidence. Causal (only past turns) → honest online."""
         from scipy.cluster.hierarchy import linkage, fcluster
         raw = list(self.ld.raw)
-        items = [(s, e, emb) for (s, e, sid, emb) in raw
+        items = [(s, e, emb, sid) for (s, e, sid, emb) in raw
                  if emb is not None and not np.isnan(emb).any()]
         if len(items) < 3:
             return None
@@ -222,6 +236,14 @@ class Manager:
             if c not in cmap:
                 cmap[c] = self.gnext; self.gnext += 1
         self.gcentroids = {cmap[c]: cen[c] for c in clu}     # recomputed → no EMA drift
+        # registry stable_id -> global id, by majority, so FRESH-tail captions (not yet
+        # reclustered) can be tagged from the online registry instead of the previous ID.
+        votes = {}
+        for i in range(len(items)):
+            reg_sid, gid = items[i][3], cmap[int(lab[i])]
+            votes.setdefault(reg_sid, {}).setdefault(gid, 0)
+            votes[reg_sid][gid] += 1
+        self.reg2global = {r: max(v, key=v.get) for r, v in votes.items()}
         turns = [(items[i][0], items[i][1], cmap[int(lab[i])]) for i in range(len(items))]
         return self._merge_keep(turns, self.ld.merge_gap, self.ld.min_change_dur)
 
@@ -237,6 +259,45 @@ class Manager:
                 d["turns"] += 1; last = sid
         return [{"speaker": sid, "turns": d["turns"], "talk": round(d["talk"], 1),
                  "last_t": round(d["last_t"], 1)} for sid, d in sorted(info.items())]
+
+    # ── fast change detection (Tier 1) ───────────────────────────────────────
+    def _fast_current(self, audio, decide_n):
+        """Diarize a SHORT recent window (not dominated by the previous speaker) and
+        return who is talking in its last ~1.5 s, matched against the drift-free
+        global centroids. Returns (global_id, sim) for a confident known speaker,
+        ('NEW', sim) for an as-yet-unknown voice (→ show provisional, never the old
+        ID), or (None, 0) when there isn't a usable signal yet."""
+        if decide_n <= 0 or len(audio) < self.ld.warmup_n:
+            return None, 0.0
+        win = audio[-decide_n:]
+        out = self.ld.pipe({"waveform": torch.from_numpy(win).unsqueeze(0), "sample_rate": SR})
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        ann = out.exclusive_speaker_diarization
+        embs = out.speaker_embeddings
+        labels = ann.labels()
+        end = len(win) / SR
+        dom = {}                                       # who dominates the last 1.5 s
+        for turn, _, label in ann.itertracks(yield_label=True):
+            ov = max(0.0, min(turn.end, end) - max(turn.start, end - 1.5))
+            if ov > 0:
+                dom[label] = dom.get(label, 0.0) + ov
+        if not dom:
+            return None, 0.0
+        label = max(dom, key=dom.get)
+        i = labels.index(label) if label in labels else -1
+        emb = embs[i] if (embs is not None and 0 <= i < len(embs)) else None
+        if emb is None or np.isnan(emb).any():
+            return None, 0.0
+        u = emb / (np.linalg.norm(emb) + 1e-9)
+        best_sid, best = None, -1.0
+        for sid, gc in self.gcentroids.items():
+            sim = float(u @ gc)
+            if sim > best:
+                best, best_sid = sim, sid
+        if best >= self.args.fast_match:
+            return best_sid, best
+        return "NEW", best
 
     # ── session control (called from the WS handler / async loop) ────────────
     def start(self, url):
@@ -328,6 +389,8 @@ class Manager:
         next_asr = a.asr_interval
         next_clock = 1.0
         next_recluster = a.recluster_sec if a.recluster_sec > 0 else float("inf")
+        decide_n = int(a.decide_window * SR)
+        last_fast = None
         recent = []
         last_word = ""
 
@@ -342,12 +405,27 @@ class Manager:
             self.media_t = media_t
             asr_audio = np.concatenate([asr_audio, pkt])
 
-            # ---- diarization: commit fine-grained turns into ld.raw ----
+            # ---- diarization: commit fine-grained turns + FAST change detection ----
             if media_t >= next_diar:
                 next_diar = media_t + ld.stride
                 buf, tot = ld._snapshot()
                 if len(buf) >= ld.warmup_n:
                     ld.process(buf, tot / SR)
+                    # fast detector: who's talking NOW, from a short window (Tier 1)
+                    if decide_n > 0 and self.gcentroids:
+                        try:
+                            fsid, fsim = self._fast_current(buf, decide_n)
+                        except Exception:
+                            fsid, fsim = None, 0.0
+                        if fsid is not None:
+                            self.fast_sid = fsid
+                            prov = (fsid == "NEW")
+                            cur = None if prov else fsid
+                            if (cur, prov) != last_fast:
+                                last_fast = (cur, prov)
+                                broadcast({"type": "current", "t": round(media_t, 1),
+                                           "speaker": cur, "provisional": prov,
+                                           "sim": round(fsim, 2)})
 
             # ---- lightweight clock for the dashboard's video-sync frontier ----
             if media_t >= next_clock:
@@ -419,17 +497,33 @@ class Manager:
                                 continue
                             emitted_until = max(emitted_until, a_end)
                             mid = (a_start + a_end) / 2.0
-                            spk_g = _speaker_at(self.last_turns, mid)   # authoritative global ID
                             spk_o = _speaker_at(blocks, mid)            # online presence (for flags)
+                            # identity, freshest-first: reclustered → fast detector →
+                            # registry→global map. Never fall back to the previous ID:
+                            # if we can't tell yet, mark the caption PROVISIONAL.
+                            spk_g = _speaker_at(self.last_turns, mid)   # settled (reclustered)
+                            provisional = False
+                            if spk_g is None:                            # fresh tail
+                                fs = self.fast_sid
+                                if fs == "NEW":
+                                    provisional = True
+                                elif fs is not None:
+                                    spk_g = fs
+                                else:
+                                    rsid = _reg_at(ld.raw, mid)
+                                    spk_g = self.reg2global.get(rsid) if rsid is not None else None
+                            if spk_g is None and not provisional:
+                                provisional = True
+                            disp = spk_g if spk_g is not None else (self.cur_global or 1)
                             dur = max(a_end - a_start, 0.1)
                             flags = _hallucination_flags(txt, dur, spk_o, recent)
                             recent.append(txt); recent[:] = recent[-5:]
-                            disp = spk_g if spk_g is not None else (self.cur_global or 1)
                             wall = time.time() - t0
                             self.log({"type": "caption", "speaker": disp, "text": txt,
+                                      "provisional": provisional,
                                       "t": round(a_start, 1), "end_t": round(a_end, 1),
                                       "latency": round(wall - a_end, 2), "flags": flags})
-                            self._srt(a_start, a_end, disp, txt)
+                            self._srt(a_start, a_end, ("?" if provisional else disp), txt)
                     except Exception as e:
                         self.log({"type": "status", "msg": f"asr error: {e}"})
                     keep_from = max(emitted_until - overlap - 1.0, asr_start)
@@ -499,14 +593,21 @@ def main():
     ap.add_argument("--asr-overlap", type=float, default=2.0)
     ap.add_argument("--no-vad", action="store_true",
                     help="disable VAD filtering (captures every word; may hallucinate on silence/music)")
-    ap.add_argument("--recluster-sec", type=float, default=5.0,
+    ap.add_argument("--recluster-sec", type=float, default=2.0,
                     help="re-cluster all turns every N s for consistent, drift-free IDs (0 disables)")
     ap.add_argument("--recluster-dist", type=float, default=0.55,
                     help="agglomerative distance cutoff for re-clustering (lower = more speakers)")
     ap.add_argument("--stride", type=float, default=1.0,
                     help="diarization commit cadence (s) — lower = faster speaker switches")
-    ap.add_argument("--commit-lag", type=float, default=0.75,
+    ap.add_argument("--commit-lag", type=float, default=0.5,
                     help="hold back the newest N s before committing (lower = faster, less context)")
+    ap.add_argument("--decide-window", type=float, default=6.0,
+                    help="short window (s) diarized each stride for FAST speaker-change detection; "
+                         "0 disables. Not dominated by the previous speaker, so a new voice is "
+                         "spotted in ~1s instead of waiting for the 15s window to split it.")
+    ap.add_argument("--fast-match", type=float, default=0.5,
+                    help="cosine cutoff for the fast detector to trust a known speaker; below this "
+                         "the new voice is shown as provisional ('identifying…') — never the old ID")
     ap.add_argument("--language", default=None, help="force ASR language (e.g. en, ur); default auto")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--match-sim", type=float, default=0.30)
