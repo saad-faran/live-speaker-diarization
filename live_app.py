@@ -358,6 +358,29 @@ class Manager:
                          f"[SPEAKER {sid}] {text}\n\n")
         self.srt_f.flush()
 
+    # ── real-time ingestion (reader thread) ──────────────────────────────────
+    def _reader(self):
+        """Drain ffmpeg at real-time (it is -re paced) into the rolling diarization
+        buffer AND a bounded recent-audio buffer for ASR. Running this in its own
+        thread decouples ingestion from compute, so media time always tracks the
+        live edge and heavy processing simply SKIPS AHEAD instead of accumulating lag."""
+        step = int(0.5 * SR) * 2
+        while not self.stop_evt.is_set():
+            try:
+                raw = self.proc.stdout.read(step)
+            except Exception:
+                break
+            if not raw:
+                break
+            pkt = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            self.ld.feed(pkt)
+            with self.alock:
+                self.aud = np.concatenate([self.aud, pkt])
+                if len(self.aud) > self.aud_max:
+                    self.aud = self.aud[-self.aud_max:]
+                self.aud_end = self.ld.total / SR
+        self.stop_evt.set()
+
     # ── the streaming pipeline (worker thread) ───────────────────────────────
     def _run(self, url):
         a = self.args
@@ -378,32 +401,32 @@ class Manager:
             stdout=subprocess.PIPE, bufsize=10 ** 7)
         self.log({"type": "status", "msg": f"● live on {self.device.upper()} — diarizing"})
 
+        # shared buffers filled by the reader thread (real-time)
+        self.aud = np.zeros(0, dtype=np.float32)
+        self.aud_end = 0.0
+        self.aud_max = int(40 * SR)                 # keep the last 40 s for ASR
+        self.alock = threading.Lock()
+        threading.Thread(target=self._reader, daemon=True).start()
+
         t0 = time.time()
-        step = int(0.5 * SR) * 2
-        fed = 0
-        asr_audio = np.zeros(0, dtype=np.float32)
-        asr_start = 0.0
         emitted_until = 0.0
         overlap = a.asr_overlap
-        next_diar = ld.stride
+        next_diar = 0.0
         next_asr = a.asr_interval
         next_clock = 1.0
         next_recluster = a.recluster_sec if a.recluster_sec > 0 else float("inf")
+        next_fast = 0.0
         decide_n = int(a.decide_window * SR)
         last_fast = None
         recent = []
         last_word = ""
 
         while not self.stop_evt.is_set():
-            raw = self.proc.stdout.read(step)
-            if not raw:
-                break
-            pkt = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            ld.feed(pkt)
-            fed += len(pkt)
-            media_t = fed / SR
+            media_t = self.ld.total / SR            # tracks the LIVE edge (reader-driven)
             self.media_t = media_t
-            asr_audio = np.concatenate([asr_audio, pkt])
+            if media_t < 1.0:
+                time.sleep(0.05); continue
+            did = False
 
             # ---- diarization: commit fine-grained turns + FAST change detection ----
             if media_t >= next_diar:
@@ -411,8 +434,9 @@ class Manager:
                 buf, tot = ld._snapshot()
                 if len(buf) >= ld.warmup_n:
                     ld.process(buf, tot / SR)
-                    # fast detector: who's talking NOW, from a short window (Tier 1)
-                    if decide_n > 0 and self.gcentroids:
+                    # fast detector: who's talking NOW (rate-limited to protect real-time)
+                    if decide_n > 0 and self.gcentroids and media_t >= next_fast:
+                        next_fast = media_t + max(ld.stride, 1.5)
                         try:
                             fsid, fsim = self._fast_current(buf, decide_n)
                         except Exception:
@@ -426,6 +450,7 @@ class Manager:
                                 broadcast({"type": "current", "t": round(media_t, 1),
                                            "speaker": cur, "provisional": prov,
                                            "sim": round(fsim, 2)})
+                did = True
 
             # ---- lightweight clock for the dashboard's video-sync frontier ----
             if media_t >= next_clock:
@@ -455,13 +480,24 @@ class Manager:
                                                      "total_speakers": len(self.gcentroids),
                                                      "changes": n_changes, "roster": roster}) + "\n")
                         self.log_f.flush()
+                did = True
 
-            # ---- ASR (overlapping, boundary-safe) ----
+            # ---- ASR (overlapping, boundary-safe, REAL-TIME skip-ahead) ----
             if media_t >= next_asr:
                 next_asr = media_t + a.asr_interval
-                seg_from = max(emitted_until - overlap, asr_start)
-                i0 = int(round((seg_from - asr_start) * SR))
-                chunk = asr_audio[max(i0, 0):]
+                with self.alock:
+                    aud = self.aud.copy(); aud_end = self.aud_end
+                aud_start = aud_end - len(aud) / SR
+                seg_from = max(emitted_until - overlap, aud_start)
+                # If transcription has fallen behind the live edge, JUMP FORWARD to the
+                # recent audio (drop the backlog) so captions stay near-live instead of
+                # lagging further and further — bounded lag, never accumulating.
+                if aud_end - seg_from > a.asr_max_lag:
+                    seg_from = max(aud_end - (overlap + a.asr_interval), aud_start)
+                    emitted_until = seg_from
+                    last_word = ""
+                i0 = int(round((seg_from - aud_start) * SR))
+                chunk = aud[max(i0, 0):]
                 if len(chunk) >= SR:
                     try:
                         segs, _ = self.asr.transcribe(
@@ -526,11 +562,10 @@ class Manager:
                             self._srt(a_start, a_end, ("?" if provisional else disp), txt)
                     except Exception as e:
                         self.log({"type": "status", "msg": f"asr error: {e}"})
-                    keep_from = max(emitted_until - overlap - 1.0, asr_start)
-                    drop = int(round((keep_from - asr_start) * SR))
-                    if drop > 0:
-                        asr_audio = asr_audio[drop:]
-                        asr_start = keep_from
+                did = True
+
+            if not did:
+                time.sleep(0.03)
 
         self.log({"type": "status", "msg": "stream ended / stopped"})
 
@@ -591,6 +626,9 @@ def main():
     ap.add_argument("--asr-interval", type=float, default=2.5,
                     help="transcribe every N s — LOWER = lower caption latency (needs a fast GPU)")
     ap.add_argument("--asr-overlap", type=float, default=2.0)
+    ap.add_argument("--asr-max-lag", type=float, default=6.0,
+                    help="if transcription falls more than N s behind the live edge, skip ahead "
+                         "to recent audio (bounds caption lag; drops the backlog)")
     ap.add_argument("--no-vad", action="store_true",
                     help="disable VAD filtering (captures every word; may hallucinate on silence/music)")
     ap.add_argument("--recluster-sec", type=float, default=2.0,
