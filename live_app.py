@@ -122,6 +122,72 @@ def _speaker_at(blocks, t):
     return best
 
 
+class StreamingASR:
+    """Low-latency streaming ASR via LocalAgreement-2 over faster-whisper.
+
+    Instead of transcribing fixed overlapping chunks (which trade latency for
+    duplicated boundary words), keep a rolling buffer and re-transcribe it often;
+    a word is CONFIRMED and emitted only once two consecutive hypotheses agree on
+    it (the longest common prefix). Confirmed words are stable, never duplicated,
+    and surface ~1-2s after they're spoken. The buffer is trimmed past confirmed
+    words so it stays short and fast."""
+
+    def __init__(self, model, language, sr):
+        self.model, self.language, self.sr = model, language, sr
+        self.lock = threading.Lock()
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.buf_start = 0.0        # media time of buf[0]
+        self.committed_end = 0.0    # media time confirmed+emitted up to
+        self.prev = []              # previous hypothesis: (norm, word, start, end)
+        self.max_buf = int(28 * sr)
+
+    @staticmethod
+    def _norm(w):
+        return w.strip().lower().strip(".,!?\"'-")
+
+    def insert(self, pkt):
+        with self.lock:
+            self.buf = np.concatenate([self.buf, pkt])
+            if len(self.buf) > self.max_buf:          # bound the buffer (drop oldest)
+                drop = len(self.buf) - self.max_buf
+                self.buf = self.buf[drop:]
+                self.buf_start += drop / self.sr
+                self.committed_end = max(self.committed_end, self.buf_start)
+
+    def process(self):
+        """Run one hypothesis; return newly CONFIRMED words as (norm, word, start, end)."""
+        with self.lock:
+            buf = self.buf.copy(); buf_start = self.buf_start
+        if len(buf) < int(1.0 * self.sr):
+            return []
+        segs, _ = self.model.transcribe(
+            buf, language=self.language, beam_size=1, condition_on_previous_text=False,
+            word_timestamps=True, vad_filter=True,
+            vad_parameters=dict(threshold=0.3, min_silence_duration_ms=200, speech_pad_ms=150))
+        words = [(self._norm(w.word), w.word, buf_start + w.start, buf_start + w.end)
+                 for sg in segs for w in (sg.words or []) if self._norm(w.word)]
+        # drop words that START before the committed edge (already emitted) so a
+        # just-confirmed word is never emitted a second time ("a a", "power power")
+        words = [w for w in words if w[2] >= self.committed_end - 0.10]
+        # LocalAgreement-2: confirm the longest common prefix of the last two hypotheses
+        out = []
+        for a, b in zip(self.prev, words):
+            if a[0] == b[0]:
+                out.append(b)
+            else:
+                break
+        self.prev = words
+        if out:
+            self.committed_end = out[-1][3]
+            with self.lock:
+                keep_from = max(self.committed_end - 1.0, self.buf_start)
+                drop = int(round((keep_from - self.buf_start) * self.sr))
+                if 0 < drop < len(self.buf):
+                    self.buf = self.buf[drop:]
+                    self.buf_start = keep_from
+        return out
+
+
 def _reg_at(raw, t):
     """Registry stable-id of the committed turn active at time t (raw = ld.raw)."""
     best = None
@@ -184,6 +250,7 @@ class Manager:
         self.cur_global = None
         self.reg2global = {}       # registry stable_id -> global id (for FRESH-tail tagging)
         self.fast_sid = None       # fast detector's current speaker ('NEW' = provisional)
+        self.sasr = None           # StreamingASR instance (when --streaming-asr)
 
     # ── incremental global re-clustering ─────────────────────────────────────
     @staticmethod
@@ -374,6 +441,8 @@ class Manager:
                 break
             pkt = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             self.ld.feed(pkt)
+            if self.sasr is not None:
+                self.sasr.insert(pkt)
             with self.alock:
                 self.aud = np.concatenate([self.aud, pkt])
                 if len(self.aud) > self.aud_max:
@@ -406,6 +475,8 @@ class Manager:
         self.aud_end = 0.0
         self.aud_max = int(40 * SR)                 # keep the last 40 s for ASR
         self.alock = threading.Lock()
+        if a.streaming_asr:
+            self.sasr = StreamingASR(self.asr, a.language, SR)
         threading.Thread(target=self._reader, daemon=True).start()
 
         t0 = time.time()
@@ -413,6 +484,7 @@ class Manager:
         overlap = a.asr_overlap
         next_diar = 0.0
         next_asr = a.asr_interval
+        next_asr_s = a.stream_interval
         next_clock = 1.0
         next_recluster = a.recluster_sec if a.recluster_sec > 0 else float("inf")
         next_fast = 0.0
@@ -420,6 +492,38 @@ class Manager:
         last_fast = None
         recent = []
         last_word = ""
+        line_words = []                             # streaming: confirmed words in the current line
+
+        def emit_caption(a_start, a_end, txt):
+            """Shared caption emit: speaker tagging (freshest-first, provisional) + log + SRT."""
+            txt = txt.strip()
+            if not txt:
+                return
+            blocks = ld.finalize()
+            mid = (a_start + a_end) / 2.0
+            spk_o = _speaker_at(blocks, mid)
+            spk_g = _speaker_at(self.last_turns, mid)
+            provisional = False
+            if spk_g is None:
+                fs = self.fast_sid
+                if fs == "NEW":
+                    provisional = True
+                elif fs is not None:
+                    spk_g = fs
+                else:
+                    rsid = _reg_at(ld.raw, mid)
+                    spk_g = self.reg2global.get(rsid) if rsid is not None else None
+            if spk_g is None and not provisional:
+                provisional = True
+            disp = spk_g if spk_g is not None else (self.cur_global or 1)
+            dur = max(a_end - a_start, 0.1)
+            flags = _hallucination_flags(txt, dur, spk_o, recent)
+            recent.append(txt); recent[:] = recent[-5:]
+            wall = time.time() - t0
+            self.log({"type": "caption", "speaker": disp, "text": txt, "provisional": provisional,
+                      "t": round(a_start, 1), "end_t": round(a_end, 1),
+                      "latency": round(wall - a_end, 2), "flags": flags})
+            self._srt(a_start, a_end, ("?" if provisional else disp), txt)
 
         while not self.stop_evt.is_set():
             media_t = self.ld.total / SR            # tracks the LIVE edge (reader-driven)
@@ -482,8 +586,28 @@ class Manager:
                         self.log_f.flush()
                 did = True
 
-            # ---- ASR (overlapping, boundary-safe, REAL-TIME skip-ahead) ----
-            if media_t >= next_asr:
+            # ---- streaming ASR (LocalAgreement, low latency) ----
+            if a.streaming_asr and media_t >= next_asr_s:
+                next_asr_s = media_t + a.stream_interval
+                try:
+                    conf = self.sasr.process()
+                except Exception as e:
+                    conf = []
+                    self.log({"type": "status", "msg": f"asr error: {e}"})
+                for _nw, word, ws, we in conf:
+                    if line_words and ws - line_words[-1][2] > 1.2:      # pause → flush line
+                        emit_caption(line_words[0][1], line_words[-1][2],
+                                     "".join(x[0] for x in line_words))
+                        line_words = []
+                    line_words.append((word, ws, we))
+                    if word.strip()[-1:] in ".?!" or len(line_words) >= 14:
+                        emit_caption(line_words[0][1], line_words[-1][2],
+                                     "".join(x[0] for x in line_words))
+                        line_words = []
+                did = True
+
+            # ---- windowed ASR (default: overlapping, boundary-safe, skip-ahead) ----
+            if not a.streaming_asr and media_t >= next_asr:
                 next_asr = media_t + a.asr_interval
                 with self.alock:
                     aud = self.aud.copy(); aud_end = self.aud_end
@@ -629,6 +753,11 @@ def main():
     ap.add_argument("--asr-max-lag", type=float, default=6.0,
                     help="if transcription falls more than N s behind the live edge, skip ahead "
                          "to recent audio (bounds caption lag; drops the backlog)")
+    ap.add_argument("--streaming-asr", action="store_true",
+                    help="LOW-LATENCY streaming ASR (LocalAgreement-2): emit each word once two "
+                         "passes agree — ~1-2s latency, no duplicated boundary words")
+    ap.add_argument("--stream-interval", type=float, default=0.7,
+                    help="how often the streaming ASR re-transcribes its buffer (s)")
     ap.add_argument("--no-vad", action="store_true",
                     help="disable VAD filtering (captures every word; may hallucinate on silence/music)")
     ap.add_argument("--recluster-sec", type=float, default=2.0,
